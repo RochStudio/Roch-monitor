@@ -17,6 +17,11 @@
 //! records the board it was confirmed on and how. A reading outside the band its rail can
 //! physically hold is dropped rather than shown.
 //!
+//! The ports are reached through PawnIO's LpcIO module where it is installed, one handle per
+//! config port: the module admits that slot's config pair, and the ports of the chip's BARs once
+//! it has found them with the chip in configuration mode. inpoutx64, where PawnIO is not
+//! installed, admits every port. The protocols are the same either way.
+//!
 //! SAFETY: the only writes are the ones the read path needs: the vendor unlock and lock sequences,
 //! the logical-device selector, and the page/bank/index registers that address a sensor byte. There
 //! is no write to any sensor, fan, PWM or configuration value, and no primitive that could make
@@ -24,9 +29,11 @@
 //! ISA bus mutex the mainstream tools take.
 
 use crate::engine::{Batch, Source};
+use crate::hw::Driver;
 use crate::hw::cpuid::Vendor;
-use crate::hw::inpout::{InpOut, driver};
+use crate::hw::inpout::driver;
 use crate::hw::mutex;
+use crate::hw::ports::Ports;
 use crate::model::{DeviceInfo, DeviceKind, Group, SensorInfo};
 use crate::system::SystemInfo;
 
@@ -93,64 +100,65 @@ struct IteChip {
     step: f64,
 }
 
-/// Probe both config ports for a Nuvoton chip. Returns what answered, recognised or not.
-fn probe_nuvoton(io: &InpOut) -> Vec<(u16, u16, u16)> {
-    let mut found = Vec::new();
-    let Some(_bus) = mutex::isa().lock(mutex::WAIT_MS) else { return found };
-    for port in CONFIG_PORTS {
-        io.outb(port, NUVOTON_UNLOCK);
-        io.outb(port, NUVOTON_UNLOCK);
-        let read = |reg: u8| {
-            io.outb(port, reg);
-            io.inb(port + 1)
-        };
-        let id = ((read(REG_CHIP_ID_HIGH) as u16) << 8) | read(REG_CHIP_ID_LOW) as u16;
-        let mut base = 0u16;
-        if id != 0x0000 && id != 0xFFFF {
-            io.outb(port, REG_LOGICAL_DEVICE);
-            io.outb(port + 1, LDN_EC_SPACE);
-            base = ((read(REG_BASE_HIGH) as u16) << 8) | read(REG_BASE_LOW) as u16;
+fn read_config(io: &Ports, port: u16, reg: u8) -> Option<u8> {
+    io.outb(port, reg)?;
+    io.inb(port + 1)
+}
+
+/// A big-endian pair of config registers: the chip id, a base address.
+fn read_config_word(io: &Ports, port: u16, (high, low): (u8, u8)) -> Option<u16> {
+    Some(((read_config(io, port, high)? as u16) << 8) | read_config(io, port, low)? as u16)
+}
+
+/// Probe one config port for a Nuvoton chip: its (id, sensor window base) when one answered,
+/// recognised or not. The chip is locked again however the probe ends.
+fn probe_nuvoton(io: &Ports, port: u16) -> Option<(u16, u16)> {
+    let found = (|| {
+        io.outb(port, NUVOTON_UNLOCK)?;
+        io.outb(port, NUVOTON_UNLOCK)?;
+        let id = read_config_word(io, port, (REG_CHIP_ID_HIGH, REG_CHIP_ID_LOW))?;
+        if id == 0x0000 || id == 0xFFFF {
+            return None;
         }
-        // Never leave the chip unlocked.
-        io.outb(port, NUVOTON_LOCK);
-        if id != 0x0000 && id != 0xFFFF && base != 0 && base != 0xFFFF {
-            found.push((port, id, base));
-        }
-    }
+        io.admit_bars();
+        io.outb(port, REG_LOGICAL_DEVICE)?;
+        io.outb(port + 1, LDN_EC_SPACE)?;
+        let base = read_config_word(io, port, (REG_BASE_HIGH, REG_BASE_LOW))?;
+        (base != 0 && base != 0xFFFF).then_some((id, base))
+    })();
+    // Never leave the chip unlocked.
+    let _ = io.outb(port, NUVOTON_LOCK);
     found
 }
 
-fn probe_ite(io: &InpOut) -> Vec<IteChip> {
-    let mut found = Vec::new();
-    let Some(_bus) = mutex::isa().lock(mutex::WAIT_MS) else { return found };
-    for port in CONFIG_PORTS {
+fn probe_ite(io: &Ports, port: u16) -> Option<IteChip> {
+    let found = (|| {
         for b in ITE_UNLOCK {
-            io.outb(port, b);
+            io.outb(port, b)?;
         }
-        io.outb(port, if port == 0x2E { 0x55 } else { 0xAA });
-        let read = |reg: u8| {
-            io.outb(port, reg);
-            io.inb(port + 1)
-        };
-        let id = ((read(REG_CHIP_ID_HIGH) as u16) << 8) | read(REG_CHIP_ID_LOW) as u16;
-        let known = ite_name(id);
-        let mut base = 0u16;
-        if known.is_some() {
-            io.outb(port, REG_LOGICAL_DEVICE);
-            io.outb(port + 1, LDN_ITE_EC);
-            base = ((read(REG_BASE_HIGH) as u16) << 8) | read(REG_BASE_LOW) as u16;
-        }
-        // ITE's exit: write 0x02 to configuration register 0x02.
-        io.outb(port, 0x02);
-        io.outb(port + 1, 0x02);
-        if let Some((name, step)) = known
-            && base != 0
-            && base != 0xFFFF
-        {
-            found.push(IteChip { name, port, base, step });
-        }
-    }
+        io.outb(port, if port == 0x2E { 0x55 } else { 0xAA })?;
+        let id = read_config_word(io, port, (REG_CHIP_ID_HIGH, REG_CHIP_ID_LOW))?;
+        let (name, step) = ite_name(id)?;
+        io.admit_bars();
+        io.outb(port, REG_LOGICAL_DEVICE)?;
+        io.outb(port + 1, LDN_ITE_EC)?;
+        let base = read_config_word(io, port, (REG_BASE_HIGH, REG_BASE_LOW))?;
+        (base != 0 && base != 0xFFFF).then_some(IteChip { name, port, base, step })
+    })();
+    // ITE's exit: write 0x02 to configuration register 0x02.
+    let _ = io.outb(port, 0x02);
+    let _ = io.outb(port + 1, 0x02);
     found
+}
+
+/// What one driver's probe came to.
+enum Probe {
+    Found(Box<SuperIo>),
+    /// The driver works; there is just no chip it should read. Final: the other driver would
+    /// find the same.
+    Absent(String),
+    /// The driver is not there; the other may be.
+    Unavailable(String),
 }
 
 /// How a raw channel becomes a reading.
@@ -404,13 +412,13 @@ fn ite_intel() -> Vec<Channel> {
     ]
 }
 
+/// Each chip with the ports that reach it: one PawnIO handle per config slot, or inpoutx64.
 enum Transport {
-    Nuvoton(NuvotonChip),
-    Ite(Vec<IteChip>),
+    Nuvoton(NuvotonChip, Ports),
+    Ite(Vec<(IteChip, Ports)>),
 }
 
 pub struct SuperIo {
-    io: &'static InpOut,
     transport: Transport,
     channels: Vec<Channel>,
     /// Fans seen turning at least once, by key.
@@ -426,26 +434,82 @@ pub fn board_device(sys: &SystemInfo, detail: &str) -> DeviceInfo {
 }
 
 impl SuperIo {
-    pub fn detect(sys: &SystemInfo, out: &mut Batch) -> Option<SuperIo> {
-        let io = match driver() {
-            Ok(io) => io,
-            Err(e) => {
-                out.status(format!("Board sensors unavailable: {e}"));
-                return None;
+    pub fn detect(sys: &SystemInfo, out: &mut Batch, driver_choice: Driver) -> Option<SuperIo> {
+        let mut unavailable = Vec::new();
+        #[cfg(windows)]
+        if driver_choice.pawnio() {
+            let open = |port| crate::hw::pawnio::PortModule::lpc(port).map(Ports::PawnIo);
+            match Self::probe_with(sys, &open) {
+                Probe::Found(s) => return Some(*s),
+                Probe::Absent(why) => {
+                    out.status(why);
+                    return None;
+                }
+                Probe::Unavailable(e) => unavailable.push(e),
             }
+        }
+        if driver_choice.inpout() {
+            match driver() {
+                Ok(io) => match Self::probe_with(sys, &|_| Ok(Ports::InpOut(io))) {
+                    Probe::Found(s) => return Some(*s),
+                    Probe::Absent(why) => {
+                        out.status(why);
+                        return None;
+                    }
+                    Probe::Unavailable(e) => unavailable.push(e),
+                },
+                Err(e) => unavailable.push(e.to_owned()),
+            }
+        }
+        out.status(format!("Board sensors unavailable: {}.", unavailable.join("; ")));
+        None
+    }
+
+    /// Probe both config ports through one driver, `open` giving the ports for each.
+    fn probe_with(sys: &SystemInfo, open: &dyn Fn(u16) -> Result<Ports, String>) -> Probe {
+        let mut handles = Vec::new();
+        for port in CONFIG_PORTS {
+            match open(port) {
+                Ok(io) => handles.push((port, io)),
+                Err(e) => return Probe::Unavailable(e),
+            }
+        }
+        let driver = handles[0].1.driver();
+        let Some(bus) = mutex::isa().lock(mutex::WAIT_MS) else {
+            return Probe::Absent("Board sensors: another tool held the ISA bus through the whole probe.".into());
         };
         let vendor = sys.vendor();
-        let nuvoton = probe_nuvoton(io);
         let mut declined = Vec::new();
-        for &(port, id, base) in &nuvoton {
+        let mut nuvoton = None;
+        let mut answered = false;
+        for (i, (port, io)) in handles.iter().enumerate() {
+            let Some((id, base)) = probe_nuvoton(io, *port) else { continue };
+            answered = true;
             let chip = if let Some(name) = nct668x_name(id) {
-                NuvotonChip { family: Family::Nct668x, port, id, name, base }
+                NuvotonChip { family: Family::Nct668x, port: *port, id, name, base }
             } else if let Some(name) = nct679x_name(id) {
-                NuvotonChip { family: Family::Nct679x, port, id, name, base }
+                NuvotonChip { family: Family::Nct679x, port: *port, id, name, base }
             } else {
                 declined.push(format!("0x{id:04X} at 0x{port:02X}"));
                 continue;
             };
+            nuvoton = Some((i, chip));
+            break;
+        }
+        // Only when no Nuvoton part answered: the ITE unlock is a different byte sequence on the
+        // same ports, and there is no reason to send it to a chip that has already identified.
+        let mut ite = Vec::new();
+        if !answered {
+            for (i, (port, io)) in handles.iter().enumerate() {
+                if let Some(chip) = probe_ite(io, *port) {
+                    ite.push((i, chip));
+                }
+            }
+        }
+        drop(bus);
+
+        if let Some((i, chip)) = nuvoton {
+            let io = handles.swap_remove(i).1;
             let channels = match (chip.family, vendor) {
                 (Family::Nct668x, Vendor::Amd) => nct668x_amd(),
                 (Family::Nct668x, _) => nct668x_intel(),
@@ -453,92 +517,88 @@ impl SuperIo {
             };
             let detail = format!("Nuvoton {}", chip.name);
             let status = format!(
-                "Super I/O: Nuvoton {} (0x{:04X}) at 0x{:02X}, sensor window 0x{:04X}.",
+                "Super I/O: Nuvoton {} (0x{:04X}) at 0x{:02X}, sensor window 0x{:04X}, through {driver}.",
                 chip.name, chip.id, chip.port, chip.base
             );
-            return Some(SuperIo {
-                io,
+            return Probe::Found(Box::new(SuperIo {
                 device: board_device(sys, &detail),
-                transport: Transport::Nuvoton(chip),
+                transport: Transport::Nuvoton(chip, io),
                 channels,
                 spun: Default::default(),
                 status,
-            });
+            }));
         }
-        // Only when no Nuvoton part answered: the ITE unlock is a different byte sequence on the
-        // same ports, and there is no reason to send it to a chip that has already identified.
-        if nuvoton.is_empty() {
-            let chips = probe_ite(io);
-            if !chips.is_empty() {
-                let names: Vec<&str> = chips.iter().map(|c| c.name).collect();
-                let detail = format!("ITE {}", names.join(" + "));
-                let where_: Vec<String> =
-                    chips.iter().map(|c| format!("{} at 0x{:02X} window 0x{:04X}", c.name, c.port, c.base)).collect();
-                let channels = ite_intel()
-                    .into_iter()
-                    .filter(|c| c.chip.is_some_and(|n| names.contains(&n)))
-                    .map(|mut c| {
-                        let step = chips.iter().find(|i| Some(i.name) == c.chip).map_or(0.0, |i| i.step);
-                        if let Decode::VoltByte(_) = c.decode {
-                            c.decode = Decode::VoltByte(step);
-                        }
-                        c
-                    })
-                    .collect();
-                return Some(SuperIo {
-                    io,
-                    device: board_device(sys, &detail),
-                    status: format!("Super I/O: {}.", where_.join(", ")),
-                    transport: Transport::Ite(chips),
-                    channels,
-                    spun: Default::default(),
-                });
+        if !ite.is_empty() {
+            let names: Vec<&str> = ite.iter().map(|(_, c)| c.name).collect();
+            let detail = format!("ITE {}", names.join(" + "));
+            let where_: Vec<String> =
+                ite.iter().map(|(_, c)| format!("{} at 0x{:02X} window 0x{:04X}", c.name, c.port, c.base)).collect();
+            let channels = ite_intel()
+                .into_iter()
+                .filter(|c| c.chip.is_some_and(|n| names.contains(&n)))
+                .map(|mut c| {
+                    let step = ite.iter().find(|(_, i)| Some(i.name) == c.chip).map_or(0.0, |(_, i)| i.step);
+                    if let Decode::VoltByte(_) = c.decode {
+                        c.decode = Decode::VoltByte(step);
+                    }
+                    c
+                })
+                .collect();
+            // Move each chip's handle out, highest index first so the others stay where they are.
+            let mut chips = Vec::new();
+            for (i, chip) in ite.into_iter().rev() {
+                chips.push((chip, handles.swap_remove(i).1));
             }
+            chips.reverse();
+            return Probe::Found(Box::new(SuperIo {
+                device: board_device(sys, &detail),
+                status: format!("Super I/O: {}, through {driver}.", where_.join(", ")),
+                transport: Transport::Ite(chips),
+                channels,
+                spun: Default::default(),
+            }));
         }
-        out.status(if declined.is_empty() {
+        Probe::Absent(if declined.is_empty() {
             "Board sensors: no supported Super I/O answered on 0x2E or 0x4E.".to_owned()
         } else {
             format!(
                 "Board sensors: declined Super I/O {} (no confirmed register map; reading it would print plausible numbers that are not measurements).",
                 declined.join(", ")
             )
-        });
-        None
+        })
     }
 
-    /// Read every channel's raw value under one acquisition of the bus.
+    /// Read every channel's raw value under one acquisition of the bus. A channel whose port
+    /// access failed is `None`, not a byte.
     fn read_raw(&self) -> Option<Vec<Option<u32>>> {
-        let io = self.io;
         let _bus = mutex::isa().lock(mutex::WAIT_MS)?;
         let raws = match &self.transport {
-            Transport::Nuvoton(chip) => {
-                let read_byte = |address: u16| -> u8 {
+            Transport::Nuvoton(chip, io) => {
+                let read_byte = |address: u16| -> Option<u8> {
                     match chip.family {
                         Family::Nct668x => {
                             // The 0xFF preamble on the page register is required; without it
                             // every read returns the same byte.
-                            io.outb(chip.base + 4, 0xFF);
-                            io.outb(chip.base + 4, (address >> 8) as u8);
-                            io.outb(chip.base + 5, address as u8);
+                            io.outb(chip.base + 4, 0xFF)?;
+                            io.outb(chip.base + 4, (address >> 8) as u8)?;
+                            io.outb(chip.base + 5, address as u8)?;
                             io.inb(chip.base + 6)
                         }
                         Family::Nct679x => {
-                            io.outb(chip.base + 5, 0x4E);
-                            io.outb(chip.base + 6, (address >> 8) as u8);
-                            io.outb(chip.base + 5, address as u8);
+                            io.outb(chip.base + 5, 0x4E)?;
+                            io.outb(chip.base + 6, (address >> 8) as u8)?;
+                            io.outb(chip.base + 5, address as u8)?;
                             io.inb(chip.base + 6)
                         }
                     }
                 };
                 self.channels
                     .iter()
-                    .map(|c| {
-                        Some(match c.decode {
-                            Decode::TempWord | Decode::VoltWord(_) | Decode::RpmWord => {
-                                ((read_byte(c.address) as u32) << 8) | read_byte(c.address + 1) as u32
-                            }
-                            _ => read_byte(c.address) as u32,
-                        })
+                    .map(|c| match c.decode {
+                        Decode::TempWord | Decode::VoltWord(_) | Decode::RpmWord => {
+                            Some(((read_byte(c.address)? as u32) << 8) | read_byte(c.address + 1)? as u32)
+                        }
+                        _ => read_byte(c.address).map(u32::from),
                     })
                     .collect()
             }
@@ -546,9 +606,9 @@ impl SuperIo {
                 .channels
                 .iter()
                 .map(|c| {
-                    let chip = chips.iter().find(|i| Some(i.name) == c.chip)?;
-                    io.outb(chip.base + 5, c.address as u8);
-                    Some(io.inb(chip.base + 6) as u32)
+                    let (chip, io) = chips.iter().find(|(i, _)| Some(i.name) == c.chip)?;
+                    io.outb(chip.base + 5, c.address as u8)?;
+                    io.inb(chip.base + 6).map(u32::from)
                 })
                 .collect(),
         };

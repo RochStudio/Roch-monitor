@@ -851,9 +851,16 @@ pub struct AmdSmu {
 }
 
 impl AmdSmu {
-    pub fn detect(sys: &SystemInfo, out: &mut Batch) -> Option<AmdSmu> {
+    pub fn detect(sys: &SystemInfo, out: &mut Batch, driver_choice: crate::hw::Driver) -> Option<AmdSmu> {
         if let Err(why) = cpu_gate(sys) {
             out.status(why);
+            return None;
+        }
+        // PawnIO's RyzenSMU module would serve this too, but its mailbox sequence has not been
+        // run against the B850M bench these offsets were confirmed on, so the table is still read
+        // the way it was confirmed: through inpoutx64.
+        if !driver_choice.inpout() {
+            out.status("SMU PM table: read through inpoutx64 only, which --driver pawnio rules out.");
             return None;
         }
         let driver = match driver() {

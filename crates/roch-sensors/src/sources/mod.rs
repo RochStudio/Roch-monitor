@@ -22,9 +22,11 @@ use crate::system::SystemInfo;
 /// Which optional sources to start.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// The board, DIMM, MCHBAR, SMU PM-table and EC transports, which need the inpoutx64 driver,
-    /// and the per-core MSRs, which need PawnIO.
+    /// The driver-based transports: the per-core MSRs, the board, DIMM, MCHBAR and EC sensors,
+    /// and the AMD SMU's PM table.
     pub hardware: bool,
+    /// Which kernel driver those go through.
+    pub driver: crate::hw::Driver,
     pub gpu: bool,
     pub drives: bool,
     pub network: bool,
@@ -35,7 +37,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Self { hardware: true, gpu: true, drives: true, network: true, pmic_adc: true }
+        Self { hardware: true, driver: crate::hw::Driver::Auto, gpu: true, drives: true, network: true, pmic_adc: true }
     }
 }
 
@@ -54,25 +56,36 @@ pub fn factories(sys: &SystemInfo, options: Options) -> Vec<(String, Factory)> {
         add("System", Box::new(move |_: &mut Batch| boxed(Some(system_usage::SystemUsage::new(&s)))));
     }
     // Decided before anything starts, so the counter clocks know whether to stand aside.
-    let msr = options.hardware && msr::available(&sys);
+    let driver = options.driver;
+    let msr = options.hardware && driver.pawnio() && msr::available(&sys);
     {
         let s = sys.clone();
         add("CPU counters", Box::new(move |b: &mut Batch| boxed(cpu_load::CpuLoad::detect(&s, b, !msr))));
     }
     if options.hardware {
         let s = sys.clone();
-        add("Per-core MSRs", Box::new(move |b: &mut Batch| boxed(msr::CpuMsr::detect(&s, b))));
+        if driver.pawnio() {
+            add("Per-core MSRs", Box::new(move |b: &mut Batch| boxed(msr::CpuMsr::detect(&s, b))));
+        } else {
+            add(
+                "Per-core MSRs",
+                Box::new(|b: &mut Batch| {
+                    b.status("Per-core MSRs: read through PawnIO only, which --driver inpoutx64 rules out.");
+                    None
+                }),
+            );
+        }
         let s = sys.clone();
-        add("MCHBAR", Box::new(move |b: &mut Batch| boxed(intel_mchbar::IntelMchbar::detect(&s, b))));
+        add("MCHBAR", Box::new(move |b: &mut Batch| boxed(intel_mchbar::IntelMchbar::detect(&s, b, driver))));
         let s = sys.clone();
-        add("SMU PM table", Box::new(move |b: &mut Batch| boxed(amd_smu::AmdSmu::detect(&s, b))));
+        add("SMU PM table", Box::new(move |b: &mut Batch| boxed(amd_smu::AmdSmu::detect(&s, b, driver))));
         let s = sys.clone();
-        add("Super I/O", Box::new(move |b: &mut Batch| boxed(superio::SuperIo::detect(&s, b))));
+        add("Super I/O", Box::new(move |b: &mut Batch| boxed(superio::SuperIo::detect(&s, b, driver))));
         let s = sys.clone();
-        add("ASUS EC", Box::new(move |b: &mut Batch| boxed(asus_ec::AsusEc::detect(&s, b))));
+        add("ASUS EC", Box::new(move |b: &mut Batch| boxed(asus_ec::AsusEc::detect(&s, b, driver))));
         let s = sys.clone();
         let adc = options.pmic_adc;
-        add("DIMM sensors", Box::new(move |b: &mut Batch| boxed(dimm::Dimms::detect(&s, b, adc))));
+        add("DIMM sensors", Box::new(move |b: &mut Batch| boxed(dimm::Dimms::detect(&s, b, adc, driver))));
     }
     if options.gpu {
         add("Graphics", Box::new(|b: &mut Batch| boxed(gpu::Gpus::detect(b))));

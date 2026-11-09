@@ -3,6 +3,11 @@
 //! differs. Intel publishes it in the SMBus function's PCI config space (00:1F.4 BAR4), AMD
 //! through the PMIO index/data ports, and AMD has a second controller 0x20 above the first.
 //!
+//! Two ways to the controller. PawnIO's SmbusI801 and SmbusPIIX4 modules, where PawnIO is
+//! installed, find the controller themselves and carry out whole transfers; the I801 module also
+//! waits out the firmware's hold on the bus (INUSE_STS) first. inpoutx64, where PawnIO is not,
+//! drives the controller's registers from here. The rules below sit above both.
+//!
 //! SAFETY, as Roch Viewer draws it:
 //!
 //!   * Every read assembles the address byte with the read direction bit set, from a path that has
@@ -20,6 +25,28 @@ use std::time::{Duration, Instant};
 use crate::hw::inpout::InpOut;
 use crate::hw::{mutex, pci};
 
+/// How transfers reach the controller.
+enum Backend {
+    InpOut {
+        io: &'static InpOut,
+        base: u16,
+    },
+    #[cfg(windows)]
+    PawnIo(crate::hw::pawnio::SmbusModule),
+}
+
+/// A PawnIO transfer's Win32 error as this transport's error.
+#[cfg(windows)]
+fn pawnio_error(code: u32) -> SmbusError {
+    match code {
+        // ERROR_SEM_TIMEOUT, WAIT_TIMEOUT, ERROR_TIMEOUT: STATUS_IO_TIMEOUT and kin.
+        121 | 258 | 1460 => SmbusError::Timeout,
+        // ERROR_BUSY: STATUS_DEVICE_BUSY, the host still busy from another owner.
+        170 => SmbusError::Busy,
+        _ => SmbusError::Device,
+    }
+}
+
 const REG_STATUS: u16 = 0x00;
 const REG_CONTROL: u16 = 0x02;
 const REG_COMMAND: u16 = 0x03;
@@ -35,6 +62,13 @@ const BUSY: u8 = 0x01;
 const INTR: u8 = 0x02;
 const ERROR_MASK: u8 = 0x04 | 0x08 | 0x10;
 const CLEAR: u8 = 0x1F;
+/// Intel's host status bit 6, INUSE_STS: a semaphore among everything that drives the controller
+/// (firmware, drivers, monitoring tools). Any read of the status register sets it; writing a 1
+/// releases it. This path reads status in every wait, so it must release the semaphore when a
+/// transfer ends, as Linux's i2c-i801 does: Roch Viewer's original never did, which left the bus
+/// looking permanently claimed to anything that honours it, PawnIO's SmbusI801 among them (every
+/// transfer through it then timed out after 90 ms on the Z790-P bench). AMD's FCH has no such bit.
+const INUSE_STS: u8 = 0x40;
 
 pub const THERMAL_SENSORS: std::ops::Range<u8> = 0x18..0x20;
 pub const PMICS: std::ops::Range<u8> = 0x48..0x50;
@@ -60,8 +94,7 @@ pub enum SmbusError {
 }
 
 pub struct Smbus {
-    io: &'static InpOut,
-    pub base: u16,
+    backend: Backend,
     pub platform: Platform,
 }
 
@@ -94,7 +127,10 @@ impl Smbus {
                 reasons.push(format!("00:1F.{function} BAR4 0x{bar:08X}"));
                 continue;
             }
-            return Ok(Smbus { io, base: (bar & 0xFFE0) as u16, platform: Platform::IntelPch });
+            return Ok(Smbus {
+                backend: Backend::InpOut { io, base: (bar & 0xFFE0) as u16 },
+                platform: Platform::IntelPch,
+            });
         }
         Err(format!("no Intel SMBus controller ({})", reasons.join("; ")))
     }
@@ -108,7 +144,35 @@ impl Smbus {
         let high = io.inb(0xCD7) as u16;
         let base = ((high << 8) | low) & 0xFFE0;
         let base = if base == 0 || base == 0xFFE0 { 0x0B00 } else { base };
-        Smbus { io, base, platform: Platform::AmdFch }
+        Smbus { backend: Backend::InpOut { io, base }, platform: Platform::AmdFch }
+    }
+
+    /// Through PawnIO: SmbusI801 on Intel, SmbusPIIX4 on AMD. Each module finds and checks the
+    /// controller itself, and declines to load where there is none.
+    #[cfg(windows)]
+    pub fn pawnio(platform: Platform) -> Result<Smbus, String> {
+        use crate::hw::pawnio::SmbusModule;
+        let module = match platform {
+            Platform::IntelPch => SmbusModule::i801()?,
+            Platform::AmdFch => SmbusModule::piix4()?,
+        };
+        Ok(Smbus { backend: Backend::PawnIo(module), platform })
+    }
+
+    /// Which controller, where, and through which driver, for the status line.
+    pub fn describe(&self) -> String {
+        let what = match self.platform {
+            Platform::IntelPch => "Intel PCH SMBus",
+            Platform::AmdFch => "AMD FCH SMBus",
+        };
+        match &self.backend {
+            Backend::InpOut { base, .. } => format!("{what} at 0x{base:04X} through inpoutx64"),
+            #[cfg(windows)]
+            Backend::PawnIo(m) => match m.io_base() {
+                Some(base) => format!("{what} at 0x{base:04X} through PawnIO {}", m.module),
+                None => format!("{what} through PawnIO {}", m.module),
+            },
+        }
     }
 
     /// The controllers DIMMs may answer on.
@@ -132,47 +196,65 @@ pub struct Session<'a> {
     _guard: mutex::Guard<'static>,
 }
 
+fn wait_idle(io: &InpOut, base: u16) -> Result<(), SmbusError> {
+    let deadline = Instant::now() + TIMEOUT;
+    while io.inb(base + REG_STATUS) & BUSY != 0 {
+        if Instant::now() > deadline {
+            return Err(SmbusError::Busy);
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    Ok(())
+}
+
+fn wait_done(io: &InpOut, base: u16) -> Result<(), SmbusError> {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let status = io.inb(base + REG_STATUS);
+        if status & ERROR_MASK != 0 {
+            return Err(SmbusError::Device);
+        }
+        if status & INTR != 0 && status & BUSY == 0 {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            return Err(SmbusError::Timeout);
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+}
+
 impl Session<'_> {
-    fn wait_idle(&self, base: u16) -> Result<(), SmbusError> {
-        let deadline = Instant::now() + TIMEOUT;
-        while self.bus.io.inb(base + REG_STATUS) & BUSY != 0 {
-            if Instant::now() > deadline {
-                return Err(SmbusError::Busy);
-            }
-            std::thread::sleep(Duration::from_micros(200));
-        }
-        Ok(())
+    /// What the inpoutx64 path writes to the status register as a transfer ends: the status flags
+    /// cleared and, on Intel, the INUSE_STS semaphore released.
+    fn release(&self) -> u8 {
+        if self.bus.platform == Platform::IntelPch { CLEAR | INUSE_STS } else { CLEAR }
     }
 
-    fn wait_done(&self, base: u16) -> Result<(), SmbusError> {
-        let deadline = Instant::now() + TIMEOUT;
-        loop {
-            let status = self.bus.io.inb(base + REG_STATUS);
-            if status & ERROR_MASK != 0 {
-                return Err(SmbusError::Device);
-            }
-            if status & INTR != 0 && status & BUSY == 0 {
-                return Ok(());
-            }
-            if Instant::now() > deadline {
-                return Err(SmbusError::Timeout);
-            }
-            std::thread::sleep(Duration::from_micros(200));
-        }
-    }
-
-    /// One read transfer. The address byte always carries the read bit.
+    /// One read transfer. The address byte always carries the read bit: inpoutx64's path sets it
+    /// here, PawnIO's path passes the read direction, and neither takes a direction parameter.
     fn read(&self, controller: u16, address: u8, command: u8, protocol: u8) -> Result<(u8, u8), SmbusError> {
-        let io = self.bus.io;
-        let base = self.bus.base + controller;
-        self.wait_idle(base)?;
-        io.outb(base + REG_STATUS, CLEAR);
-        io.outb(base + REG_ADDRESS, (address << 1) | 1);
-        io.outb(base + REG_COMMAND, command);
-        io.outb(base + REG_CONTROL, protocol | START);
-        let result = self.wait_done(base).map(|()| (io.inb(base + REG_DATA0), io.inb(base + REG_DATA1)));
-        io.outb(base + REG_STATUS, CLEAR);
-        result
+        match &self.bus.backend {
+            Backend::InpOut { io, base } => {
+                let base = base + controller;
+                wait_idle(io, base)?;
+                io.outb(base + REG_STATUS, CLEAR);
+                io.outb(base + REG_ADDRESS, (address << 1) | 1);
+                io.outb(base + REG_COMMAND, command);
+                io.outb(base + REG_CONTROL, protocol | START);
+                let result = wait_done(io, base).map(|()| (io.inb(base + REG_DATA0), io.inb(base + REG_DATA1)));
+                io.outb(base + REG_STATUS, self.release());
+                result
+            }
+            #[cfg(windows)]
+            Backend::PawnIo(m) => {
+                use crate::hw::pawnio::{SMBUS_BYTE_DATA, SMBUS_WORD_DATA};
+                let protocol = if protocol == PROTOCOL_WORD_DATA { SMBUS_WORD_DATA } else { SMBUS_BYTE_DATA };
+                // A word comes back as DATA0 | DATA1 << 8, the controller's two data registers.
+                let v = m.read(controller, address, command, protocol).map_err(pawnio_error)?;
+                Ok((v as u8, (v >> 8) as u8))
+            }
+        }
     }
 
     /// Read Word Data from a JEDEC thermal sensor, bytes in wire order (a JC-42.4 sensor sends its
@@ -197,18 +279,24 @@ impl Session<'_> {
         if !is_writable(address, PMIC_ADC_SELECT) {
             return Err(SmbusError::Refused);
         }
-        let io = self.bus.io;
-        let base = self.bus.base + controller;
-        self.wait_idle(base)?;
-        io.outb(base + REG_STATUS, CLEAR);
-        // The only transfer on this transport that clears the direction bit.
-        io.outb(base + REG_ADDRESS, address << 1);
-        io.outb(base + REG_COMMAND, PMIC_ADC_SELECT);
-        io.outb(base + REG_DATA0, value);
-        io.outb(base + REG_CONTROL, PROTOCOL_BYTE_DATA | START);
-        let result = self.wait_done(base);
-        io.outb(base + REG_STATUS, CLEAR);
-        result
+        match &self.bus.backend {
+            Backend::InpOut { io, base } => {
+                let base = base + controller;
+                wait_idle(io, base)?;
+                io.outb(base + REG_STATUS, CLEAR);
+                // The only transfer on this transport that clears the direction bit.
+                io.outb(base + REG_ADDRESS, address << 1);
+                io.outb(base + REG_COMMAND, PMIC_ADC_SELECT);
+                io.outb(base + REG_DATA0, value);
+                io.outb(base + REG_CONTROL, PROTOCOL_BYTE_DATA | START);
+                let result = wait_done(io, base);
+                io.outb(base + REG_STATUS, self.release());
+                result
+            }
+            // The only call on this transport that passes the write direction.
+            #[cfg(windows)]
+            Backend::PawnIo(m) => m.write_byte(controller, address, PMIC_ADC_SELECT, value).map_err(pawnio_error),
+        }
     }
 }
 
@@ -236,6 +324,20 @@ mod tests {
         }
         for hub in SPD_HUBS {
             assert!(!is_writable(hub, 0x0B));
+        }
+    }
+
+    /// `cargo test -p roch-sensors pawnio_thermal -- --ignored --nocapture`, elevated, with PawnIO.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs PawnIO, an elevated process and an Intel SMBus"]
+    fn pawnio_thermal_sensor_reads() {
+        let m = crate::hw::pawnio::SmbusModule::i801().expect("SmbusI801");
+        let _bus = mutex::smbus().lock(mutex::WAIT_MS).expect("the SMBus mutex");
+        for address in THERMAL_SENSORS {
+            let t = Instant::now();
+            let r = m.read(0, address, 0x05, crate::hw::pawnio::SMBUS_WORD_DATA);
+            println!("0x{address:02X}: {r:?} in {:?}", t.elapsed());
         }
     }
 }

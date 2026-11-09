@@ -12,10 +12,11 @@
 use std::time::Duration;
 
 use crate::engine::{Batch, Source};
+use crate::hw::Driver;
 use crate::hw::cpuid::Vendor;
 use crate::hw::inpout::driver;
 use crate::model::{DeviceInfo, DeviceKind, Group, SensorInfo};
-use crate::sources::smbus::{PMICS, Platform, SPD_HUBS, Session, Smbus, THERMAL_SENSORS};
+use crate::sources::smbus::{PMICS, Platform, SPD_HUBS, Session, Smbus, SmbusError, THERMAL_SENSORS};
 use crate::system::{SystemInfo, slot_name};
 
 // --- DDR4, JC-42.4 / TSE2004av.
@@ -158,31 +159,50 @@ fn module_device(sys: &SystemInfo, slot: usize, detail: String) -> DeviceInfo {
 }
 
 impl Dimms {
-    pub fn detect(sys: &SystemInfo, out: &mut Batch, measure_adc: bool) -> Option<Dimms> {
-        let io = match driver() {
-            Ok(io) => io,
-            Err(e) => {
-                out.status(format!("DIMM sensors unavailable: {e}"));
-                return None;
-            }
-        };
-        let bus = match sys.vendor() {
-            Vendor::Intel => match Smbus::intel(io) {
-                Ok(bus) => bus,
-                Err(e) => {
-                    out.status(format!("DIMM sensors: {e}."));
-                    return None;
-                }
-            },
+    pub fn detect(sys: &SystemInfo, out: &mut Batch, measure_adc: bool, driver_choice: Driver) -> Option<Dimms> {
+        let platform = match sys.vendor() {
+            Vendor::Intel => Platform::IntelPch,
             // AM5 only: Roch Viewer's FCH path was written and validated there.
-            Vendor::Amd if sys.cpu.family >= 0x19 && sys.memory_generation() == Some("DDR5") => Smbus::amd(io),
+            Vendor::Amd if sys.cpu.family >= 0x19 && sys.memory_generation() == Some("DDR5") => Platform::AmdFch,
             _ => {
                 out.status("DIMM sensors: no SMBus transport for this platform.");
                 return None;
             }
         };
+        let mut reasons = Vec::new();
+        let mut bus = None;
+        #[cfg(windows)]
+        if driver_choice.pawnio() {
+            match Smbus::pawnio(platform) {
+                Ok(b) => bus = Some(b),
+                Err(e) => reasons.push(e),
+            }
+        }
+        if bus.is_none() && driver_choice.inpout() {
+            match driver() {
+                Ok(io) => match platform {
+                    Platform::IntelPch => match Smbus::intel(io) {
+                        Ok(b) => bus = Some(b),
+                        Err(e) => reasons.push(e),
+                    },
+                    Platform::AmdFch => bus = Some(Smbus::amd(io)),
+                },
+                Err(e) => reasons.push(e.to_owned()),
+            }
+        }
+        let Some(bus) = bus else {
+            out.status(format!("DIMM sensors unavailable: {}.", reasons.join("; ")));
+            return None;
+        };
         let generation = sys.memory_generation();
         let mut modules = Vec::new();
+        // First transfers to each address, and how many of them timed out: all of them timing out
+        // is a controller somebody else has claimed, not a kit without sensors.
+        let (mut tried, mut timed_out) = (0u32, 0u32);
+        let mut count = |timeout: bool| {
+            tried += 1;
+            timed_out += timeout as u32;
+        };
         {
             let Some(s) = bus.session() else {
                 out.status("DIMM sensors: the SMBus was held by another tool during detection.");
@@ -192,6 +212,7 @@ impl Dimms {
                 if generation != Some("DDR4") {
                     for hub in SPD_HUBS {
                         let ty = [s.read_ddr5_byte(controller, hub, 0x00), s.read_ddr5_byte(controller, hub, 0x01)];
+                        count(matches!(ty[0], Err(SmbusError::Timeout)));
                         // Believed only once the device identifies as an SPD5 hub.
                         if ty != [Ok(HUB_TYPE[0]), Ok(HUB_TYPE[1])] {
                             continue;
@@ -220,7 +241,9 @@ impl Dimms {
                 }
                 if modules.is_empty() && generation != Some("DDR5") && bus.platform == Platform::IntelPch {
                     for tsod in THERMAL_SENSORS {
-                        if s.read_thermal_word(controller, tsod, TSOD_AMBIENT).is_ok() {
+                        let r = s.read_thermal_word(controller, tsod, TSOD_AMBIENT);
+                        count(matches!(r, Err(SmbusError::Timeout)));
+                        if r.is_ok() {
                             let slot = (tsod - THERMAL_SENSORS.start) as usize;
                             modules.push(Module {
                                 controller,
@@ -236,14 +259,17 @@ impl Dimms {
                 }
             }
         }
-        let where_ = match bus.platform {
-            Platform::IntelPch => format!("Intel PCH SMBus at 0x{:04X}", bus.base),
-            Platform::AmdFch => format!("AMD FCH SMBus at 0x{:04X}", bus.base),
-        };
+        let where_ = bus.describe();
         if modules.is_empty() {
-            out.status(format!(
-                "DIMM sensors: {where_}; no module answered (a DDR4 kit's thermal sensor is optional, and many are built without one)."
-            ));
+            out.status(if tried > 0 && timed_out == tried {
+                format!(
+                    "DIMM sensors: {where_}; every transfer timed out, so the controller is claimed by the firmware or another tool (its INUSE_STS semaphore is held)."
+                )
+            } else {
+                format!(
+                    "DIMM sensors: {where_}; no module answered (a DDR4 kit's thermal sensor is optional, and many are built without one)."
+                )
+            });
             return None;
         }
         let found: Vec<String> = modules

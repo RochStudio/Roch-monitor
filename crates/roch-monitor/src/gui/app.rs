@@ -12,6 +12,7 @@ use eframe::egui::{
     pos2, vec2,
 };
 use roch_sensors::engine::{Engine, MIN_INTERVAL_MS, State};
+use roch_sensors::hw::Driver;
 use roch_sensors::model::{DeviceKind, format_value};
 use roch_sensors::sources::{Options, factories};
 use roch_sensors::system::SystemInfo;
@@ -59,6 +60,8 @@ pub struct MonitorApp {
     logger: Option<CsvLogger>,
     notice: Option<(String, Instant)>,
     hardware_note: Option<String>,
+    /// Whether PawnIO opened when the window started, for the Sources window.
+    pawnio: Result<(), String>,
     search_id: egui::Id,
     /// False under test, so a test never writes the user's settings file.
     persist: bool,
@@ -93,19 +96,38 @@ fn start_engine(ctx: &Context, sys: &SystemInfo, options: Options, settings: &Se
     engine
 }
 
+/// Why the driver-based sensors are missing, when they are. PawnIO answering is enough; inpoutx64
+/// is only asked when PawnIO is not there, so a machine with PawnIO never loads it.
+fn driver_note(sys: &SystemInfo, options: &Options, pawnio: &Result<(), String>) -> Option<String> {
+    if !options.hardware {
+        return Some(
+            "Started with --no-hardware: per-core, board, DIMM and memory-controller sensors are off.".to_owned(),
+        );
+    }
+    if options.driver.pawnio() && pawnio.is_ok() {
+        return None;
+    }
+    if options.driver.inpout() && roch_sensors::hw::inpout::driver().is_ok() {
+        return None;
+    }
+    Some(if !sys.elevated {
+        "Not running as administrator, so no driver can open: per-core, board, DIMM and memory-controller sensors are missing.".to_owned()
+    } else {
+        "No driver for the per-core, board, DIMM and memory-controller sensors: install PawnIO from pawnio.eu. Sources says what each source found.".to_owned()
+    })
+}
+
+fn pawnio_state(options: &Options) -> Result<(), String> {
+    if options.hardware && options.driver.pawnio() {
+        roch_sensors::hw::pawnio::available()
+    } else {
+        Err("not used".into())
+    }
+}
+
 impl MonitorApp {
     pub fn new(ctx: &Context, sys: SystemInfo, settings: Settings, options: Options) -> MonitorApp {
-        let hardware_note = if !options.hardware {
-            Some("Started with --no-hardware: board, DIMM and memory-controller sensors are off.".to_owned())
-        } else {
-            match roch_sensors::hw::inpout::driver() {
-                Ok(_) => None,
-                Err(e) if !sys.elevated => Some(format!(
-                    "Not running as administrator, so the inpoutx64 driver cannot open: board, DIMM and memory-controller sensors are missing. ({e})"
-                )),
-                Err(e) => Some(e.to_owned()),
-            }
-        };
+        let hardware_note = driver_note(&sys, &options, &pawnio_state(&options));
         let engine = start_engine(ctx, &sys, options, &settings);
         Self::with_engine(sys, settings, options, engine, hardware_note, true)
     }
@@ -129,6 +151,7 @@ impl MonitorApp {
             logger: None,
             notice: None,
             hardware_note,
+            pawnio: pawnio_state(&options),
             search_id: egui::Id::unique("roch_monitor_search"),
             persist,
             settings_window: SettingsWindow::default(),
@@ -765,11 +788,20 @@ impl MonitorApp {
         }
         let mut open = true;
         egui::Window::new("Sources").open(&mut open).default_width(760.0).resizable(true).show(ctx, |ui| {
-            let driver = match roch_sensors::hw::inpout::driver() {
-                Ok(d) => format!("inpoutx64: {}", d.path().display()),
-                Err(e) => format!("inpoutx64: {e}"),
+            let pawnio = match (&self.pawnio, self.options.hardware, self.options.driver) {
+                (_, false, _) => "PawnIO: not used (--no-hardware)".to_owned(),
+                (_, true, Driver::InpOut) => "PawnIO: not used (--driver inpoutx64)".to_owned(),
+                (Ok(()), true, _) => "PawnIO: installed, open".to_owned(),
+                (Err(e), true, _) => format!("PawnIO: {e}"),
             };
-            ui.label(RichText::new(driver).color(p.muted));
+            // Asked without loading it: inpoutx64 is only loaded by a source PawnIO could not serve.
+            let inpout = match roch_sensors::hw::inpout::loaded() {
+                Some(Ok(d)) => format!("inpoutx64: loaded from {}", d.path().display()),
+                Some(Err(e)) => format!("inpoutx64: {e}"),
+                None => "inpoutx64: not loaded".to_owned(),
+            };
+            ui.label(RichText::new(pawnio).color(p.muted));
+            ui.label(RichText::new(inpout).color(p.muted));
             ui.label(
                 RichText::new(format!("Administrator: {}", if self.sys.elevated { "yes" } else { "no" }))
                     .color(p.muted),
@@ -1371,6 +1403,33 @@ pub(crate) mod tests {
             let r = rect_of(key).unwrap_or_else(|| panic!("{key} was not drawn"));
             pos2(r.right() - 60.0, r.center().y)
         }
+    }
+
+    fn texts(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| texts(s, out)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn the_sources_window_names_both_drivers() {
+        let mut h = Harness::new();
+        h.app.show_sources = true;
+        h.frame(vec![], Modifiers::NONE);
+        let input =
+            RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1000.0, 800.0))), ..Default::default() };
+        let app = &mut h.app;
+        let mut out = h.ctx.run_ui(input, |ui| app.draw(ui));
+        out.textures_delta.clear();
+        let mut drawn = Vec::new();
+        out.shapes.iter().for_each(|s| texts(&s.shape, &mut drawn));
+        let all = drawn.join("\n");
+        // Whatever this machine has: PawnIO's state, and inpoutx64's without loading it.
+        assert!(all.lines().any(|l| l.starts_with("PawnIO: ")), "{all}");
+        assert!(all.lines().any(|l| l.starts_with("inpoutx64: ")), "{all}");
+        assert!(roch_sensors::hw::inpout::loaded().is_none(), "drawing the window loaded inpoutx64");
     }
 
     #[test]

@@ -18,8 +18,9 @@ Studio's and GPL-3.0-or-later.
 
 ## inpoutx64.dll / inpoutx64.sys (NOT distributed with this project)
 
-The board, DIMM and memory-controller sensors need a low-level access driver to read physical
-memory, PCI configuration space and I/O ports. Roch Monitor uses inpout32/64 by Highresolution
+On a machine without PawnIO, the board, DIMM and memory-controller sensors fall back to a
+low-level access driver that reads physical memory, PCI configuration space and I/O ports, and the
+AMD SMU's PM table is read through it in any case. Roch Monitor uses inpout32/64 by Highresolution
 Enterprises (www.highrez.co.uk), which reports:
 
     Copyright (c) 2008 Highresolution Enterprises.
@@ -31,18 +32,26 @@ is GPL-3.0. Obtain them from the vendor and place them beside the executable you
 
 ## PawnIO modules (bundled) and the PawnIO driver (NOT distributed with this project)
 
-`crates/roch-sensors/res/pawnio/IntelMSR.bin` and `AMDFamily17.bin` are the compiled, signed modules
-from PawnIO.Modules by namazso (https://github.com/namazso/PawnIO.Modules), release 0.2.11, included
-byte for byte and compiled into the executable. They are licensed LGPL-2.1-or-later; the licence is in
-`crates/roch-sensors/res/pawnio/COPYING.LGPL-2.1`, and their source (`IntelMSR.p`, `AMDFamily17.p`) is
-in that repository at that release. `crates/roch-sensors/res/pawnio/README.md` records each file's
-sha256. They cannot be modified and still load: the driver accepts only modules signed by their author.
+Seven compiled, signed modules from PawnIO.Modules (https://github.com/namazso/PawnIO.Modules),
+release 0.2.11, are included byte for byte in `crates/roch-sensors/res/pawnio/` and compiled into the
+executable:
+
+    IntelMSR, AMDFamily17, LpcIO, LpcACPIEC   Copyright (C) 2023-2025 namazso <admin@namazso.eu>
+    SmbusI801, SmbusPIIX4                     Copyright (C) 2025 Steve-Tech <me@stevetech.au>
+                                              (parts ported from the Linux kernel's i2c drivers)
+    IntelMCHBAR                               Copyright (C) 2026 Gen Li
+
+Each is licensed LGPL-2.1-or-later; the licence is in `crates/roch-sensors/res/pawnio/COPYING.LGPL-2.1`,
+and each module's source is the `.p` file of the same name in that repository at tag `0.2.11`.
+`crates/roch-sensors/res/pawnio/README.md` records each file's sha256 and which of its functions Roch
+Monitor calls. They cannot be modified and still load: the driver accepts only modules signed by
+their author.
 
 The modules run inside the PawnIO driver (https://pawnio.eu), which the user installs from its
 author's own signed installer. The driver is not included in this repository or in any build produced
 from it. The calling convention in `crates/roch-sensors/src/hw/pawnio.rs` (the two IOCTLs and the
-execute buffer's layout) was written from PawnIO's public `pawnio_um.h` and `PawnIOLib.cpp`; no PawnIO
-source file is included.
+execute buffer's layout) was written from PawnIO's public `pawnio_um.h` and `PawnIOLib.cpp`, and each
+module's functions from its published source; no PawnIO source file is included.
 
 ## ZenStates-Core and ZenTimings (followed, not bundled)
 

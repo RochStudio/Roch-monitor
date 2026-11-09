@@ -42,12 +42,19 @@ A sensor the machine does not have gets no row rather than a column of dashes, a
 falls outside what its rail or sensor can physically report is shown as missing rather than as a
 number.
 
+Every row that needs a kernel driver (the MSRs, MCHBAR, the Super I/O, the SMBus, the EC) reads
+through **PawnIO** where it is installed, and through **inpoutx64** for anything PawnIO cannot serve.
+With PawnIO installed, an Intel machine never loads inpoutx64; an AMD one still does for the SMU's
+PM table, if inpoutx64 is there. **Sources** names the driver each source used.
+
 ### Validated on
 
 MSI PRO Z790-P WIFI DDR4 (MS-7E06), Intel Core i9-14900KF, 2 × 16 GB G.Skill DDR4-3800,
 NVIDIA GeForce RTX 5060 Ti. Every source answers on that machine, and two independent instruments
 agree where they overlap: the MCHBAR's VCCSA (1.231 V) against the Super I/O's CPU SA (1.230 V), and
-the die's Core Max against the board's CPU thermistor. The per-core MSR readings (PawnIO 2.2.0,
+the die's Core Max against the board's CPU thermistor. Every board, memory and DIMM row reads the
+same through PawnIO as through inpoutx64 (the same 33 rows, the same values). The per-core MSR
+readings (PawnIO 2.2.0,
 IntelMSR 0.2.11) agree the same way: the hottest core's reading matches MCHBAR's Core Max, each
 core's VID (1.300 V) sits just under the Vcore the Super I/O measures (1.308 V), every core reads
 57 × 100.00 MHz against MCHBAR's bus clock, and a busy thread's effective clock follows its usage
@@ -112,23 +119,26 @@ opens with Settings at a page. Everything is saved in `%APPDATA%\RochMonitor\set
 RochMonitor.exe --dump                   sample for 3 s and print every sensor as a table
 RochMonitor.exe --dump --json            the same as JSON
 RochMonitor.exe --log out.csv --seconds 600
+RochMonitor.exe --dump --driver inpoutx64  the same through inpoutx64 only (auto, pawnio, inpoutx64)
 RochMonitor.exe --help
 ```
 
 ## Prerequisites
 
 - Windows 10 or 11, 64-bit.
-- **The inpoutx64 driver** for the board, DIMM and memory-controller sensors. It is not distributed
-  here, for the reasons Roch Viewer gives: download `inpoutx64.dll` and `inpoutx64.sys` from
-  Highresolution Enterprises (www.highrez.co.uk) and put both beside `RochMonitor.exe`. Windows
-  security software may warn about it; it is a well-known low-level access component and, for the
-  same reason, one attackers have abused, so decide for yourself whether you want it on your
-  machine.
-- **PawnIO** for the per-core temperatures, clocks and VIDs. Install it from its author's site,
-  https://pawnio.eu (the same driver LibreHardwareMonitor uses); Roch Monitor carries the two signed
-  modules it loads into it (`crates/roch-sensors/res/pawnio`) and calls only their MSR read. Without
-  it, the CPU's clocks come from the performance counters instead, and **Sources** says so.
-- **Administrator rights**, which both drivers need. The window asks for them when it starts.
+- **PawnIO** (recommended): install it from its author's site, https://pawnio.eu (the driver
+  LibreHardwareMonitor uses). It is what the per-core temperatures, clocks and VIDs need, and the
+  board, DIMM and memory-controller sensors use it too. Roch Monitor carries the seven signed
+  modules it loads into it (`crates/roch-sensors/res/pawnio`), each of which admits only its own
+  hardware: the MSRs on an allow-list, the memory controller's window, the Super I/O's ports, the
+  SMBus controller.
+- **inpoutx64** (optional fallback): for a machine without PawnIO, and for the AMD SMU's PM table,
+  which is still read through it. It is not distributed here, for the reasons Roch Viewer gives:
+  download `inpoutx64.dll` and `inpoutx64.sys` from Highresolution Enterprises (www.highrez.co.uk)
+  and put both beside `RochMonitor.exe`. It hands any administrator process every I/O port and all
+  of physical memory, which is why security software warns about it and why PawnIO is preferred.
+  `--driver pawnio` makes sure it is never loaded.
+- **Administrator rights**, which either driver needs. The window asks for them when it starts.
   Declining is allowed: CPU clocks and usage, the GPU, drives, network and WHEA work without the
   drivers, and the window says what is missing and why.
 

@@ -154,11 +154,11 @@ pub fn available(sys: &SystemInfo) -> bool {
         if !supported(sys) {
             return false;
         }
-        let (module, probe) = match sys.vendor() {
-            Vendor::Intel => (INTEL_MSR_MODULE, MSR_TEMPERATURE_TARGET),
-            _ => (AMD_FAMILY17_MODULE, AMD_PWR_UNIT),
+        let (name, module, probe) = match sys.vendor() {
+            Vendor::Intel => ("IntelMSR", INTEL_MSR_MODULE, MSR_TEMPERATURE_TARGET),
+            _ => ("AMDFamily17", AMD_FAMILY17_MODULE, AMD_PWR_UNIT),
         };
-        PawnIo::open(module).is_ok_and(|io| io.read_msr(probe).is_some())
+        PawnIo::open(name, module).is_ok_and(|io| io.read_msr(probe).is_some())
     }
     #[cfg(not(windows))]
     {
@@ -205,11 +205,12 @@ impl CpuMsr {
             return None;
         }
         let vendor = sys.vendor();
-        let module = if vendor == Vendor::Intel { INTEL_MSR_MODULE } else { AMD_FAMILY17_MODULE };
-        let io = match PawnIo::open(module) {
+        let (name, module) =
+            if vendor == Vendor::Intel { ("IntelMSR", INTEL_MSR_MODULE) } else { ("AMDFamily17", AMD_FAMILY17_MODULE) };
+        let io = match PawnIo::open(name, module) {
             Ok(io) => io,
             Err(e) => {
-                out.status(e);
+                out.status(format!("Per-core temperatures, clocks and VIDs: {e}."));
                 return None;
             }
         };

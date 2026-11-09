@@ -93,6 +93,7 @@ pub fn text(state: &State, sys: &SystemInfo) -> String {
     }
     let _ = writeln!(s);
     let _ = writeln!(s, "Sources");
+    let _ = writeln!(s, "  {:<14}{}", "Drivers", roch_sensors::hw::drivers_summary());
     for src in &state.sources {
         let took =
             if src.polls > 0 { format!(" [{:.1} ms]", src.last_poll.as_secs_f64() * 1000.0) } else { String::new() };

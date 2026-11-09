@@ -1,4 +1,6 @@
-//! Port I/O and physical reads through inpoutx64 (Roch Viewer's `lowlevel_io` + `read`).
+//! Port I/O and physical reads through inpoutx64 (Roch Viewer's `lowlevel_io` + `read`), the
+//! fallback for machines without PawnIO (see `hw::pawnio`), and the one way to the AMD SMU's PM
+//! table for now.
 //!
 //! The driver is not distributed with Roch Monitor, for the reasons Roch Viewer gives in its
 //! third-party notices: it is a well-known low-level access component and, for the same reason,
@@ -42,8 +44,17 @@ unsafe impl Sync for InpOut {}
 static DRIVER: OnceLock<Result<InpOut, String>> = OnceLock::new();
 
 /// The driver, loaded on first use. `Err` says why there is none, in words a person can act on.
+///
+/// Loading is not free of side effects: the DLL installs and starts its kernel driver if it is
+/// not running. So it is only called by a transport PawnIO could not serve.
 pub fn driver() -> Result<&'static InpOut, &'static str> {
     DRIVER.get_or_init(load).as_ref().map_err(String::as_str)
+}
+
+/// The driver if something has already loaded it (or tried to), without loading it: `None` when
+/// nothing has needed it.
+pub fn loaded() -> Option<Result<&'static InpOut, &'static str>> {
+    DRIVER.get().map(|r| r.as_ref().map_err(String::as_str))
 }
 
 /// Every place the DLL is looked for, nearest first.

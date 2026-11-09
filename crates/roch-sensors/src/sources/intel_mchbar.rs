@@ -1,16 +1,20 @@
 //! The Intel memory controller's register window, MCHBAR: clocks, the hottest core, package power
 //! and two rails (Roch Viewer's `intel_timings` sensor rows and `intel_rapl`).
 //!
-//! The driver has no RDMSR, so the readings HWiNFO takes from MSRs are taken here from where the
+//! inpoutx64 has no RDMSR, so the readings HWiNFO takes from MSRs are taken here from where the
 //! same silicon also publishes them in MCHBAR, each located by Roch Viewer against a reference
 //! tool on the Z790 benches and recorded beside its offset.
 //!
-//! Read-only: physical reads, nothing else.
+//! Through PawnIO's IntelMCHBAR module where it is installed (the module finds and maps the window
+//! itself, and reads nothing outside it), through inpoutx64's physical reads otherwise.
+//!
+//! Read-only: dword reads, nothing else.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::{Batch, Source};
+use crate::hw::Driver;
 use crate::hw::inpout::{InpOut, bits, driver};
 use crate::hw::pci;
 use crate::model::{DeviceInfo, DeviceKind, Group, SensorInfo};
@@ -92,9 +96,47 @@ pub fn memory_device(sys: &SystemInfo) -> DeviceInfo {
     DeviceInfo::new(MEMORY, DeviceKind::Memory, name).detail(parts.join(", "))
 }
 
+/// How the window is reached.
+enum Window {
+    #[cfg(windows)]
+    PawnIo(crate::hw::pawnio::Mchbar),
+    InpOut {
+        io: &'static InpOut,
+        base: u64,
+    },
+}
+
+impl Window {
+    fn read32(&self, offset: u64) -> Option<u32> {
+        match self {
+            #[cfg(windows)]
+            Window::PawnIo(m) => m.read32(offset),
+            Window::InpOut { io, base } => io.phys_read32(base + offset),
+        }
+    }
+}
+
+/// inpoutx64's way in: the host bridge says where MCHBAR is (0x48 holds the base, bit 0 its
+/// enable), with the firmware's usual address when it does not.
+fn inpout_window(io: &'static InpOut) -> (Window, u64, String) {
+    let host = pci::read32(0, 0, 0, 0x00);
+    let mut base = MCHBAR_DEFAULT;
+    let mut how = "default address, inpoutx64".to_owned();
+    if host.is_some_and(|id| id & 0xFFFF == 0x8086)
+        && let (Some(lo), Some(hi)) = (pci::read32(0, 0, 0, 0x48), pci::read32(0, 0, 0, 0x4C))
+        && lo & 1 == 1
+    {
+        let b = (((hi as u64) << 32) | lo as u64) & 0x7F_FFFE_0000;
+        if b != 0 {
+            base = b;
+            how = "host bridge 0x48, inpoutx64".into();
+        }
+    }
+    (Window::InpOut { io, base }, base, how)
+}
+
 pub struct IntelMchbar {
-    io: &'static InpOut,
-    base: u64,
+    window: Window,
     arrow_lake: bool,
     cpu: DeviceInfo,
     memory: DeviceInfo,
@@ -103,7 +145,7 @@ pub struct IntelMchbar {
 }
 
 impl IntelMchbar {
-    pub fn detect(sys: &SystemInfo, out: &mut Batch) -> Option<IntelMchbar> {
+    pub fn detect(sys: &SystemInfo, out: &mut Batch, driver_choice: Driver) -> Option<IntelMchbar> {
         if !(sys.cpu.is_lga1700() || sys.cpu.is_arrow_lake()) {
             out.status(format!(
                 "MCHBAR: not read on {} (family 0x{:X} model 0x{:X}); its offsets were located on LGA 1700 and LGA 1851 and are not pointed at silicon they were not written for.",
@@ -113,28 +155,29 @@ impl IntelMchbar {
             ));
             return None;
         }
-        let io = match driver() {
-            Ok(io) => io,
-            Err(e) => {
-                out.status(format!("MCHBAR unavailable: {e}"));
-                return None;
-            }
-        };
-        // The host bridge says where MCHBAR is: 0x48 holds the base with bit 0 as its enable.
-        let host = pci::read32(0, 0, 0, 0x00);
-        let mut base = MCHBAR_DEFAULT;
-        let mut how = "default".to_owned();
-        if host.is_some_and(|id| id & 0xFFFF == 0x8086)
-            && let (Some(lo), Some(hi)) = (pci::read32(0, 0, 0, 0x48), pci::read32(0, 0, 0, 0x4C))
-            && lo & 1 == 1
-        {
-            let b = (((hi as u64) << 32) | lo as u64) & 0x7F_FFFE_0000;
-            if b != 0 {
-                base = b;
-                how = "host bridge 0x48".into();
+        let mut reasons = Vec::new();
+        let mut found = None;
+        #[cfg(windows)]
+        if driver_choice.pawnio() {
+            match crate::hw::pawnio::Mchbar::open() {
+                Ok(m) => {
+                    let base = m.base().unwrap_or(0);
+                    found = Some((Window::PawnIo(m), base, "PawnIO IntelMCHBAR".to_owned()));
+                }
+                Err(e) => reasons.push(e),
             }
         }
-        let bclk = io.phys_read32(base + BCLK_KHZ).unwrap_or(0) as f64 / 1000.0;
+        if found.is_none() && driver_choice.inpout() {
+            match driver() {
+                Ok(io) => found = Some(inpout_window(io)),
+                Err(e) => reasons.push(e.to_owned()),
+            }
+        }
+        let Some((window, base, how)) = found else {
+            out.status(format!("MCHBAR unavailable: {}.", reasons.join("; ")));
+            return None;
+        };
+        let bclk = window.read32(BCLK_KHZ).unwrap_or(0) as f64 / 1000.0;
         if !(50.0..=300.0).contains(&bclk) {
             out.status(format!(
                 "MCHBAR at 0x{base:X} did not answer like an LGA 1700/1851 memory controller (BCLK register read {bclk:.3} MHz); nothing read from it."
@@ -147,8 +190,7 @@ impl IntelMchbar {
             if arrow_lake { ", Arrow Lake layout" } else { "" }
         );
         Some(IntelMchbar {
-            io,
-            base,
+            window,
             arrow_lake,
             cpu: cpu_device(sys),
             memory: memory_device(sys),
@@ -159,7 +201,7 @@ impl IntelMchbar {
 
     fn read(&self, offset: u64) -> Option<u32> {
         // An all-ones dword is not a value; it is unmapped MMIO answering.
-        self.io.phys_read32(self.base + offset).filter(|&v| v != 0xFFFF_FFFF)
+        self.window.read32(offset).filter(|&v| v != 0xFFFF_FFFF)
     }
 
     fn field(&self, (offset, start, width): (u64, u32, u32)) -> Option<u64> {

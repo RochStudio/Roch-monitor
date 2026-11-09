@@ -4,6 +4,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use roch_sensors::engine::Engine;
+use roch_sensors::hw::Driver;
 use roch_sensors::sources::{Options, factories};
 use roch_sensors::system::SystemInfo;
 
@@ -22,7 +23,9 @@ Options for --dump and --log:
   --seconds N        how long to sample (default 3 for --dump, 60 for --log)
   --interval MS      polling interval in milliseconds (default 1000, minimum 250)
   --json             --dump prints JSON instead of a table
-  --no-hardware      skip the driver-based sources (board, DIMMs, MCHBAR, EC)
+  --no-hardware      skip the driver-based sources (per-core MSRs, board, DIMMs, MCHBAR, EC)
+  --driver NAME      the kernel driver they use: auto (PawnIO where it is installed,
+                     inpoutx64 for anything it cannot serve; the default), pawnio or inpoutx64
   --no-gpu           skip the graphics backends
   --no-pmic-adc      read DDR5 PMIC settings but not the ADC (no selector writes)
 
@@ -32,8 +35,10 @@ Window options:
                      appearance, colours, text, layout, window or sensors
   --minimized        start in the tray (how Start with Windows launches it)
 
-Board, DIMM and memory-controller sensors need the inpoutx64 driver (inpoutx64.dll and
-inpoutx64.sys beside RochMonitor.exe) and administrator rights; everything else works without.
+Per-core temperatures, clocks and VIDs need PawnIO (pawnio.eu). The board, DIMM and
+memory-controller sensors use PawnIO too where it is installed, and the inpoutx64 driver
+(inpoutx64.dll and inpoutx64.sys beside RochMonitor.exe) where it is not. Both need
+administrator rights; everything else works without either.
 ";
 
 pub fn wants_command_line(args: &[String]) -> bool {
@@ -44,9 +49,18 @@ fn value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
 }
 
+/// `--driver`'s value: `Err` names a value that is not one.
+pub fn driver(args: &[String]) -> Result<Driver, String> {
+    match value(args, "--driver") {
+        None => Ok(Driver::Auto),
+        Some(v) => Driver::parse(v).ok_or_else(|| format!("--driver takes auto, pawnio or inpoutx64, not {v:?}")),
+    }
+}
+
 pub fn options(args: &[String]) -> Options {
     Options {
         hardware: !args.iter().any(|a| a == "--no-hardware"),
+        driver: driver(args).unwrap_or_default(),
         gpu: !args.iter().any(|a| a == "--no-gpu"),
         pmic_adc: !args.iter().any(|a| a == "--no-pmic-adc"),
         ..Options::default()
@@ -68,11 +82,15 @@ pub fn run(args: &[String]) -> i32 {
         value(args, "--seconds").and_then(|s| s.parse().ok()).unwrap_or(if logging.is_some() { 60 } else { 3 });
     let interval: u64 = value(args, "--interval").and_then(|s| s.parse().ok()).unwrap_or(1000);
 
+    if let Err(e) = driver(args) {
+        let _ = writeln!(std::io::stderr(), "{e}");
+        return 2;
+    }
     let sys = SystemInfo::detect();
     if !sys.elevated && options(args).hardware {
         let _ = writeln!(
             std::io::stderr(),
-            "Note: not running as administrator, so the inpoutx64 driver will not open; board, DIMM and MCHBAR sensors will be missing."
+            "Note: not running as administrator, so neither PawnIO nor inpoutx64 will open; per-core, board, DIMM and MCHBAR sensors will be missing."
         );
     }
     let mut engine = Engine::start(factories(&sys, options(args)), interval, 600);
@@ -132,5 +150,9 @@ mod tests {
     fn options_follow_the_flags() {
         let o = options(&v(&["--dump", "--no-gpu", "--no-pmic-adc"]));
         assert!(o.hardware && !o.gpu && !o.pmic_adc);
+        assert_eq!(o.driver, Driver::Auto);
+        assert_eq!(options(&v(&["--dump", "--driver", "pawnio"])).driver, Driver::PawnIo);
+        assert_eq!(options(&v(&["--driver", "inpoutx64"])).driver, Driver::InpOut);
+        assert!(driver(&v(&["--driver", "winring0"])).unwrap_err().contains("winring0"));
     }
 }
