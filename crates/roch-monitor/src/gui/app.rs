@@ -418,15 +418,7 @@ impl MonitorApp {
                 ui.painter().rect_filled(r, theme::radius(5), fill);
                 ui.painter().galley(r.min + vec2(10.0, 5.0), galley, color);
                 ui.add_space(8.0);
-                // The quick switch: one click between light and dark, leaving Follow Windows for
-                // the Settings window.
-                let dark = pal(&ctx).dark;
-                let theme_label = if dark { "☀ Light" } else { "☾ Dark" };
-                if ui.button(theme_label).on_hover_text("Switch between light and dark").clicked() {
-                    self.settings.appearance.theme =
-                        if dark { appearance::ThemeMode::Light } else { appearance::ThemeMode::Dark };
-                    self.changed();
-                }
+                // Light, Dark and Follow Windows are on Settings → Appearance.
                 let settings_button = egui::Button::new(RichText::new("⚙ Settings").font(theme::bold(body())));
                 let response = ui.add(settings_button).on_hover_text(
                     "Colours, font, text size, layout and window: everything about how Roch Monitor looks",

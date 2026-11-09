@@ -120,8 +120,7 @@ Every change shows on the main window as you make it:
 | Window | Always on top, opacity |
 | Sensors | Poll interval, graph history, DDR5 PMIC ADC, hidden sensors, the log folder |
 
-**☀ Light / ☾ Dark** beside it switches the theme in one click. `RochMonitor.exe --settings colours`
-opens with Settings at a page. Everything is saved in `%APPDATA%\RochMonitor\settings.json`.
+`RochMonitor.exe --settings colours` opens with Settings at a page. Everything is saved in `%APPDATA%\RochMonitor\settings.json`.
 
 ### Command line
 
