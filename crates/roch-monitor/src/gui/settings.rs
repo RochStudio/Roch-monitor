@@ -27,7 +27,19 @@ pub struct Settings {
     pub pmic_adc: bool,
     pub log_directory: Option<String>,
     pub window_size: Option<[f32; 2]>,
+    /// Sensor keys shown in the tray, each as its own icon with its value drawn in (HWiNFO's "Show
+    /// in tray"), and listed in the Roch icon's tooltip.
+    pub tray_sensors: Vec<String>,
+    /// Draw each tray sensor as an icon of its own; off lists them in the Roch icon's tooltip only.
+    pub tray_icons: bool,
+    /// Minimising hides the window in the tray.
+    pub minimize_to_tray: bool,
+    /// The close button hides the window in the tray instead of exiting; Exit is on the tray menu.
+    pub close_to_tray: bool,
 }
+
+/// How many sensors can be in the tray at once: each is an icon of its own.
+pub const MAX_TRAY_SENSORS: usize = 6;
 
 impl Default for Settings {
     fn default() -> Self {
@@ -43,6 +55,10 @@ impl Default for Settings {
             pmic_adc: true,
             log_directory: None,
             window_size: None,
+            tray_sensors: Vec::new(),
+            tray_icons: true,
+            minimize_to_tray: true,
+            close_to_tray: false,
         }
     }
 }

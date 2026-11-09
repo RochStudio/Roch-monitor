@@ -30,6 +30,7 @@ Window options:
   --no-elevate       run the window without asking for administrator rights
   --settings [PAGE]  open with the Settings window showing, optionally at a page:
                      appearance, colours, text, layout, window or sensors
+  --minimized        start in the tray (how Start with Windows launches it)
 
 Board, DIMM and memory-controller sensors need the inpoutx64 driver (inpoutx64.dll and
 inpoutx64.sys beside RochMonitor.exe) and administrator rights; everything else works without.

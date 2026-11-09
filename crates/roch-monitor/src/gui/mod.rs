@@ -8,6 +8,8 @@
 //! * [`theme`] — the palette, fonts and sizes built from those choices
 //! * [`fonts`] — the fonts installed on the machine
 //! * [`settings`] — what the window remembers
+//! * [`tray`] — the notification-area icon and HWiNFO-style value icons
+//! * [`startup`] — Start with Windows, as a logon task
 //! * [`native`] — title bars, opacity and Explorer
 
 mod app;
@@ -18,13 +20,54 @@ mod native;
 mod rows;
 mod settings;
 mod settings_window;
+mod startup;
 mod theme;
+mod tray;
 
 use std::sync::Arc;
 
 use eframe::egui;
 
 const ICON_PNG: &[u8] = include_bytes!("../../../../assets/icon.png");
+pub(crate) const ICO: &[u8] = include_bytes!("../../../../assets/RochMonitor.ico");
+
+/// Decode a PNG to (rgba, width, height).
+pub(crate) fn png_rgba(bytes: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let img = image::load_from_memory_with_format(bytes, image::ImageFormat::Png).ok()?.into_rgba8();
+    let (w, h) = img.dimensions();
+    Some((img.into_raw(), w, h))
+}
+
+/// The frame of an .ico closest to `size` px, decoded (Roch GPU's `ico_frame_rgba`). Only
+/// PNG-compressed frames are read, which is how the shipped icon stores every frame.
+pub(crate) fn ico_frame_rgba(ico: &[u8], size: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let u16_at = |o: usize| ico.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |o: usize| ico.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if u16_at(2)? != 1 {
+        return None;
+    }
+    let count = u16_at(4)? as usize;
+    let mut best: Option<(u32, usize, usize)> = None;
+    for i in 0..count {
+        let e = 6 + i * 16;
+        let w = match *ico.get(e)? {
+            0 => 256,
+            w => w as u32,
+        };
+        let len = u32_at(e + 8)? as usize;
+        let off = u32_at(e + 12)? as usize;
+        let diff = w.abs_diff(size);
+        if best.is_none_or(|(d, _, _)| diff < d) {
+            best = Some((diff, off, len));
+        }
+    }
+    let (_, off, len) = best?;
+    let data = ico.get(off..off.checked_add(len)?)?;
+    if !data.starts_with(b"\x89PNG") {
+        return None;
+    }
+    png_rgba(data)
+}
 
 fn window_icon() -> Arc<egui::IconData> {
     match image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png) {
@@ -46,6 +89,8 @@ pub fn run(args: &[String]) -> i32 {
         .iter()
         .position(|a| a == "--settings")
         .map(|i| args.get(i + 1).and_then(|name| settings_window::Page::from_name(name)));
+    // `--minimized`: start in the tray, which is how Start with Windows launches it.
+    let minimized = args.iter().any(|a| a == "--minimized") && open_settings.is_none();
     let size = settings.window_size.unwrap_or([1060.0, 920.0]);
     let icon = window_icon();
     let native = eframe::NativeOptions {
@@ -54,6 +99,7 @@ pub fn run(args: &[String]) -> i32 {
             .with_app_id("RochMonitor")
             .with_inner_size([size[0].max(780.0), size[1].max(480.0)])
             .with_min_inner_size([780.0, 480.0])
+            .with_visible(!minimized)
             .with_icon(icon.clone())
             .with_window_level(if settings.appearance.always_on_top {
                 egui::WindowLevel::AlwaysOnTop
@@ -78,6 +124,9 @@ pub fn run(args: &[String]) -> i32 {
             app.set_icon(icon);
             if let Some(page) = open_settings {
                 app.open_settings(&cc.egui_ctx, page);
+            }
+            if minimized {
+                app.start_in_tray();
             }
             Ok(Box::new(app))
         }),

@@ -57,6 +57,10 @@ pub struct Context2<'a> {
     pub sensors: usize,
     pub log_directory: String,
     pub show_hidden: &'a mut bool,
+    /// False under test: the Start with Windows box neither asks nor changes Task Scheduler.
+    pub can_change_startup: bool,
+    /// What each sensor key is called, for the list of sensors in the tray.
+    pub sensor_names: Vec<(String, String)>,
 }
 
 pub struct SettingsWindow {
@@ -66,6 +70,9 @@ pub struct SettingsWindow {
     font_filter: String,
     editing_dark: Option<bool>,
     hex: BTreeMap<String, String>,
+    /// Whether the logon task exists, asked once when the Window page is first shown.
+    startup: Option<bool>,
+    startup_error: Option<String>,
 }
 
 impl Default for SettingsWindow {
@@ -77,6 +84,8 @@ impl Default for SettingsWindow {
             font_filter: String::new(),
             editing_dark: None,
             hex: BTreeMap::new(),
+            startup: None,
+            startup_error: None,
         }
     }
 }
@@ -215,7 +224,7 @@ impl SettingsWindow {
                             Page::Colours => self.colours(ui, &mut settings.appearance),
                             Page::Text => self.text(ui, &mut settings.appearance),
                             Page::Layout => Self::layout(ui, &mut settings.appearance),
-                            Page::Window => Self::window(ui, &mut settings.appearance),
+                            Page::Window => self.window(ui, settings, &info),
                             Page::Sensors => Self::sensors(ui, settings, &mut info, &mut outcome),
                         }
                         ui.add_space(12.0);
@@ -424,7 +433,8 @@ impl SettingsWindow {
         ui.checkbox(&mut a.show_summary, "Machine summary under the title");
     }
 
-    fn window(ui: &mut Ui, a: &mut Appearance) {
+    fn window(&mut self, ui: &mut Ui, s: &mut Settings, info: &Context2) {
+        let a = &mut s.appearance;
         section(ui, "On screen");
         ui.checkbox(&mut a.always_on_top, "Keep Roch Monitor above other programs");
         let mut opacity = a.opacity * 100.0;
@@ -435,6 +445,63 @@ impl SettingsWindow {
             }
         });
         hint(ui, "For the main window; this one stays opaque so its controls stay readable.");
+
+        section(ui, "Tray");
+        ui.checkbox(&mut s.minimize_to_tray, "Minimising hides Roch Monitor in the tray");
+        ui.checkbox(&mut s.close_to_tray, "The close button hides it in the tray too (Exit is on the tray menu)");
+        ui.checkbox(&mut s.tray_icons, "Show each tray sensor as its own icon, with its value drawn in");
+        if s.tray_sensors.is_empty() {
+            hint(
+                ui,
+                "Right-click any sensor and choose Show in tray. Until then the Roch icon's tooltip lists the CPU and GPU temperatures and power.",
+            );
+        } else {
+            let mut remove = None;
+            for (i, key) in s.tray_sensors.iter().enumerate() {
+                let name = info.sensor_names.iter().find(|(k, _)| k == key).map_or(key.as_str(), |(_, n)| n.as_str());
+                ui.horizontal(|ui| {
+                    ui.label(format!("  {name}"));
+                    if ui.small_button("Remove").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            }
+            if let Some(i) = remove {
+                s.tray_sensors.remove(i);
+            }
+            hint(ui, &format!("{} of {} tray places used.", s.tray_sensors.len(), super::settings::MAX_TRAY_SENSORS));
+        }
+
+        section(ui, "Start with Windows");
+        if info.can_change_startup && self.startup.is_none() {
+            self.startup = Some(super::startup::exists());
+        }
+        let mut on = self.startup.unwrap_or(false);
+        let response = ui.add_enabled(
+            info.can_change_startup,
+            egui::Checkbox::new(&mut on, "Start Roch Monitor in the tray when I sign in"),
+        );
+        if response.changed() {
+            let result = if on { super::startup::enable() } else { super::startup::disable() };
+            match result {
+                Ok(()) => {
+                    self.startup = Some(on);
+                    self.startup_error = None;
+                }
+                Err(e) => {
+                    self.startup = Some(super::startup::exists());
+                    self.startup_error = Some(e);
+                }
+            }
+        }
+        hint(
+            ui,
+            "A Task Scheduler entry that starts it with administrator rights, so the sensors that need the driver are there from sign-in without a prompt.",
+        );
+        if let Some(e) = &self.startup_error {
+            ui.label(RichText::new(e).color(theme::pal(ui.ctx()).warn));
+        }
+
         section(ui, "Size");
         hint(ui, "The window opens at the size it was closed at.");
     }

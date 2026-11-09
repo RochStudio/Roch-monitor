@@ -19,6 +19,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
+tray-icon = "0.26"
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 workspace = true

@@ -22,6 +22,7 @@ use super::rows::{self, Row};
 use super::settings::Settings;
 use super::settings_window::{self, GRAPH_WINDOWS, INTERVALS, SettingsWindow};
 use super::theme::{self, Palette, body, pal, row};
+use super::tray::{Tray, TrayCommand, TrayValue, icon_digits};
 use crate::logger::{self, CsvLogger};
 use crate::report;
 
@@ -44,6 +45,7 @@ enum Action {
     Copy(String),
     CollapseAll,
     ExpandAll,
+    Tray(String),
 }
 
 pub struct MonitorApp {
@@ -71,6 +73,15 @@ pub struct MonitorApp {
     system_dark: (bool, Option<Instant>),
     unsaved_since: Option<Instant>,
     icon: Option<std::sync::Arc<egui::IconData>>,
+    tray: Option<Tray>,
+    /// The tray icon is made after the first frame (a few ms of shell calls the window need not
+    /// wait for), or at once when starting in the tray.
+    tray_due: bool,
+    hidden: bool,
+    start_hidden: bool,
+    /// Set by the tray's Exit, so a close-to-tray setting does not swallow it.
+    really_close: bool,
+    tray_revision: u64,
 }
 
 fn start_engine(ctx: &Context, sys: &SystemInfo, options: Options, settings: &Settings) -> Engine {
@@ -129,6 +140,12 @@ impl MonitorApp {
             system_dark: (true, None),
             unsaved_since: None,
             icon: None,
+            tray: None,
+            tray_due: persist,
+            hidden: false,
+            start_hidden: false,
+            really_close: false,
+            tray_revision: u64::MAX,
         }
     }
 
@@ -137,6 +154,134 @@ impl MonitorApp {
         self.settings_window.open(ctx);
         if let Some(page) = page {
             self.settings_window.page = page;
+        }
+    }
+
+    /// `--minimized`: the window starts hidden, and the tray icon is made at once to bring it back.
+    pub(crate) fn start_in_tray(&mut self) {
+        self.start_hidden = true;
+        self.hidden = true;
+    }
+
+    // -- the tray -----------------------------------------------------------------------------
+
+    /// Everything the tray needs each frame: make it, act on its menu, hide on minimise or close,
+    /// and give it the latest readings.
+    fn tray_tick(&mut self, ctx: &Context) {
+        if self.tray_due {
+            self.tray_due = false;
+            self.tray = Tray::new(ctx);
+            if self.tray.is_none() && self.start_hidden {
+                // Nowhere to hide: show the window rather than run invisibly with no way back.
+                self.show_from_tray(ctx);
+            }
+        }
+        let commands: Vec<TrayCommand> =
+            self.tray.as_ref().map(|t| t.commands.try_iter().collect()).unwrap_or_default();
+        for cmd in commands {
+            match cmd {
+                TrayCommand::Show => self.show_from_tray(ctx),
+                TrayCommand::Settings => {
+                    self.show_from_tray(ctx);
+                    self.settings_window.open(ctx);
+                }
+                TrayCommand::ResetStats => self.reset_stats(),
+                TrayCommand::Exit => {
+                    self.really_close = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if self.tray.is_some() && !self.hidden {
+            let (minimized, close) =
+                ctx.input(|i| (i.viewport().minimized == Some(true), i.viewport().close_requested()));
+            if minimized && self.settings.minimize_to_tray {
+                self.hide_to_tray(ctx);
+            } else if close && self.settings.close_to_tray && !self.really_close {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.hide_to_tray(ctx);
+            }
+        }
+        self.update_tray();
+    }
+
+    fn hide_to_tray(&mut self, ctx: &Context) {
+        self.hidden = true;
+        self.settings_window.open = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    fn show_from_tray(&mut self, ctx: &Context) {
+        if self.hidden {
+            self.hidden = false;
+            self.start_hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Readings for the tooltip when none have been put in the tray: the temperatures and the power
+    /// a glance at the tray is usually for.
+    const TRAY_DEFAULTS: [&'static str; 5] =
+        ["cpu/temp/package", "cpu/temp/coremax", "cpu/power/package", "gpu0/temp", "gpu0/power/board"];
+
+    /// The Roch icon's tooltip and the value icons, from the latest readings.
+    pub(crate) fn tray_contents(&self) -> (String, Vec<TrayValue>) {
+        let st = self.engine.lock();
+        let line = |key: &str| -> Option<(String, String, String)> {
+            let r = st.sensor(key)?;
+            let device = st.device(&r.info.device).map(short_device).unwrap_or_default();
+            let value = format_value(r.stat.current, &r.info.unit, r.info.decimals);
+            // "GPU Temperature" already says whose it is; "Core Max" needs "CPU" in front.
+            let name = if r.info.label.starts_with(&device) {
+                r.info.label.clone()
+            } else {
+                format!("{device} {}", r.info.label)
+            };
+            Some((format!("{name}: {value}"), icon_digits(r.stat.current, &r.info.unit), value))
+        };
+        let chosen: Vec<&str> = if self.settings.tray_sensors.is_empty() {
+            Self::TRAY_DEFAULTS.iter().copied().filter(|k| st.sensor(k).is_some()).take(4).collect()
+        } else {
+            self.settings.tray_sensors.iter().map(String::as_str).collect()
+        };
+        let mut tooltip = String::from("Roch Monitor");
+        for key in &chosen {
+            if let Some((text, _, _)) = line(key) {
+                tooltip.push('\n');
+                tooltip.push_str(&text);
+            }
+        }
+        let values = if self.settings.tray_icons {
+            self.settings
+                .tray_sensors
+                .iter()
+                .filter_map(|key| {
+                    line(key).map(|(text, digits, _)| TrayValue { key: key.clone(), digits, tooltip: text })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        (tooltip, values)
+    }
+
+    /// Push the latest readings to the tray, once per poll rather than once per frame.
+    fn update_tray(&mut self) {
+        if self.tray.is_none() {
+            return;
+        }
+        let revision = self.engine.lock().value_revision;
+        if revision == self.tray_revision {
+            return;
+        }
+        self.tray_revision = revision;
+        let (tooltip, values) = self.tray_contents();
+        let dark = self.settings.appearance.dark;
+        if let Some(tray) = &mut self.tray {
+            tray.set_tooltip(&tooltip);
+            tray.sync_values(&values, dark.value, dark.background);
         }
     }
 
@@ -433,6 +578,7 @@ impl MonitorApp {
 
         let graphs = self.settings.graphs.clone();
         let hidden = self.settings.hidden.clone();
+        let in_tray = self.settings.tray_sensors.clone();
         let stale_after = (self.engine.interval() * 3).max(Duration::from_secs(5));
         let mut actions = Vec::new();
         ui.scope(|ui| {
@@ -446,7 +592,7 @@ impl MonitorApp {
                     if matches!(row, Row::Device { .. }) {
                         band = 0;
                     }
-                    draw_row(ui, &st, row, &mut band, p, &graphs, &hidden, stale_after, &mut actions);
+                    draw_row(ui, &st, row, &mut band, p, &graphs, &hidden, &in_tray, stale_after, &mut actions);
                 }
             });
         });
@@ -485,6 +631,14 @@ impl MonitorApp {
             Action::CollapseAll => {
                 let st = self.engine.lock();
                 s.collapsed = st.devices.iter().map(|d| d.id.clone()).collect();
+            }
+            Action::Tray(key) => {
+                if s.tray_sensors.contains(&key) {
+                    s.tray_sensors.retain(|k| *k != key);
+                } else if s.tray_sensors.len() < super::settings::MAX_TRAY_SENSORS {
+                    s.tray_sensors.push(key);
+                }
+                self.tray_revision = u64::MAX;
             }
             Action::ExpandAll => {
                 s.collapsed.clear();
@@ -723,13 +877,32 @@ impl MonitorApp {
             return;
         }
         let before = self.settings.clone();
-        let sensors = self.engine.lock().sensors.len();
+        let (sensors, sensor_names) = {
+            let st = self.engine.lock();
+            let names = self
+                .settings
+                .tray_sensors
+                .iter()
+                .filter_map(|key| {
+                    let r = st.sensor(key)?;
+                    let device = st.device(&r.info.device).map(short_device).unwrap_or_default();
+                    Some((key.clone(), format!("{device} · {}", r.info.label)))
+                })
+                .collect::<Vec<_>>();
+            (st.sensors.len(), names)
+        };
         let log_directory = logger::default_directory().display().to_string();
         let main = ctx.input(|i| i.viewport().outer_rect);
         let outcome = self.settings_window.show(
             ctx,
             &mut self.settings,
-            settings_window::Context2 { sensors, log_directory, show_hidden: &mut self.show_hidden },
+            settings_window::Context2 {
+                sensors,
+                log_directory,
+                show_hidden: &mut self.show_hidden,
+                can_change_startup: self.persist,
+                sensor_names,
+            },
             self.icon.clone(),
             main,
         );
@@ -813,6 +986,7 @@ fn draw_row(
     p: &Palette,
     graphs: &[String],
     hidden: &[String],
+    in_tray: &[String],
     stale_after: Duration,
     actions: &mut Vec<Action>,
 ) {
@@ -1007,6 +1181,16 @@ fn draw_row(
                     actions.push(Action::Copy(line.clone()));
                     ui.close();
                 }
+                let tray_label = if in_tray.contains(&key) { "Remove from tray" } else { "Show in tray" };
+                let full = in_tray.len() >= super::settings::MAX_TRAY_SENSORS && !in_tray.contains(&key);
+                if ui
+                    .add_enabled(!full, egui::Button::new(tray_label))
+                    .on_disabled_hover_text("Six sensors are in the tray already")
+                    .clicked()
+                {
+                    actions.push(Action::Tray(key.clone()));
+                    ui.close();
+                }
                 ui.separator();
                 if already_hidden {
                     if ui.button("Unhide sensor").clicked() {
@@ -1040,6 +1224,7 @@ impl eframe::App for MonitorApp {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.keyboard(ctx);
         self.apply_appearance(ctx);
+        self.tray_tick(ctx);
         self.save_if_settled();
         if self.settings.appearance.theme == appearance::ThemeMode::System {
             // Follow Windows has to look again now and then, frame or no frame.
@@ -1383,5 +1568,60 @@ mod settings_tests {
         h.app.settings.appearance.group_headings = false;
         h.frame(vec![], Modifiers::NONE);
         assert_eq!(count(&h), 0);
+    }
+}
+
+#[cfg(test)]
+mod tray_tests {
+    use eframe::egui::Modifiers;
+
+    use super::tests::Harness;
+    use super::*;
+
+    #[test]
+    fn chosen_sensors_become_value_icons_and_tooltip_lines() {
+        let mut h = Harness::new();
+        let ctx = h.ctx.clone();
+        let (tooltip, values) = h.app.tray_contents();
+        assert_eq!(tooltip, "Roch Monitor", "none of the default readings exist on the fixture");
+        assert!(values.is_empty());
+        h.app.apply(&ctx, Action::Tray("board/fan/cpu".into()));
+        h.app.apply(&ctx, Action::Tray("cpu/temp/max".into()));
+        let (tooltip, values) = h.app.tray_contents();
+        assert!(tooltip.contains("Board CPU Fan: 900 RPM"), "{tooltip}");
+        assert!(tooltip.contains("CPU Core Max: 40.0 °C"), "{tooltip}");
+        let digits: Vec<&str> = values.iter().map(|v| v.digits.as_str()).collect();
+        assert_eq!(digits, vec!["900", "40"]);
+        // Off: the tooltip keeps them, the icons go.
+        h.app.settings.tray_icons = false;
+        assert!(h.app.tray_contents().1.is_empty());
+        // Choosing a sensor again takes it out of the tray.
+        h.app.apply(&ctx, Action::Tray("board/fan/cpu".into()));
+        assert_eq!(h.app.settings.tray_sensors, vec!["cpu/temp/max"]);
+    }
+
+    #[test]
+    fn the_tray_holds_at_most_six() {
+        let mut h = Harness::new();
+        let ctx = h.ctx.clone();
+        for i in 0..9 {
+            h.app.apply(&ctx, Action::Tray(format!("x/{i}")));
+        }
+        assert_eq!(h.app.settings.tray_sensors.len(), crate::gui::settings::MAX_TRAY_SENSORS);
+    }
+
+    #[test]
+    fn starting_in_the_tray_without_a_tray_shows_the_window() {
+        // Under test there is no shell to make an icon in, which is the case a machine without a
+        // notification area hits: the window must not stay invisible with no way back.
+        let mut h = Harness::new();
+        h.app.start_in_tray();
+        assert!(h.app.hidden);
+        h.app.tray_due = true;
+        h.app.tray_tick(&h.ctx.clone());
+        if h.app.tray.is_none() {
+            assert!(!h.app.hidden);
+        }
+        h.frame(vec![], Modifiers::NONE);
     }
 }

@@ -62,6 +62,23 @@ not been re-run since being ported; treat them as needing confirmation on your o
 - **Poll** sets the interval (250 ms to 10 s). Each source reads on its own thread, so a slow one
   never holds the others up; **Sources** shows what each found and how long it takes.
 
+### Tray
+
+Like HWiNFO, Roch Monitor can live in the notification area:
+
+- **Right-click a sensor → Show in tray** puts its live value in the tray as an icon of its own,
+  digits drawn in (up to six). Hover for the full reading.
+- The **Roch icon's tooltip** lists those readings, or the CPU and GPU temperatures and power when
+  none are chosen. Left-click it to bring the window back; right-click for Show, Settings,
+  Reset Stats and Exit.
+- **Minimising** hides the window in the tray. Settings → Window can make the close button do the
+  same, turn the value icons off, and **start Roch Monitor in the tray when you sign in** (a Task
+  Scheduler entry with administrator rights, so the driver-based sensors are there without a
+  prompt). `RochMonitor.exe --minimized` starts it in the tray by hand.
+
+Windows 11 puts new tray icons behind the ^ arrow at first; drag them onto the taskbar to keep them
+in view.
+
 ### Settings
 
 **⚙ Settings** (beside the LIVE badge) opens Roch GPU's Settings gear, adapted for the monitor.
