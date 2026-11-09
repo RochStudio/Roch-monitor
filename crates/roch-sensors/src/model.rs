@@ -296,8 +296,8 @@ impl History {
 }
 
 /// How a figure prints: Roch GPU's `format_reading`. An em dash for nothing read; a 0/1 "state"
-/// as No/Yes with its average as the share of samples it was active; otherwise fixed decimals
-/// and the unit.
+/// as No/Yes with its average as the share of samples it was active; a PCIe generation as "Gen 5"
+/// (the GPU backends' unit is "gen"); otherwise fixed decimals and the unit.
 pub fn format_value(value: f64, unit: &str, decimals: u8) -> String {
     if value.is_nan() {
         return "—".into();
@@ -312,6 +312,9 @@ pub fn format_value(value: f64, unit: &str, decimals: u8) -> String {
         };
     }
     let decimals = decimals as usize;
+    if unit == "gen" {
+        return format!("Gen {value:.decimals$}");
+    }
     if unit.is_empty() { format!("{value:.decimals$}") } else { format!("{value:.decimals$} {unit}") }
 }
 
@@ -375,6 +378,8 @@ mod tests {
         assert_eq!(format_value(1.0, "state", 0), "Yes");
         assert_eq!(format_value(0.25, "state", 0), "25 % active");
         assert_eq!(format_value(3.0, "", 0), "3");
+        assert_eq!(format_value(5.0, "gen", 0), "Gen 5");
+        assert_eq!(format_value(f64::NAN, "gen", 0), "—");
         assert_eq!(format_plain(f64::NAN, 2), "");
         assert_eq!(format_plain(1.23456, 3), "1.235");
     }

@@ -20,6 +20,7 @@ struct Drive {
     number: u32,
     device: DeviceInfo,
     sensors: usize,
+    nvme: bool,
 }
 
 pub struct Drives {
@@ -145,7 +146,8 @@ mod imp {
     }
 
     /// Every temperature the drive reports, composite first. Empty when it reports none.
-    pub fn temperatures(h: &Handle) -> Vec<f64> {
+    /// Each temperature the drive reports, with the index the driver gives it.
+    pub fn temperatures(h: &Handle) -> Vec<(u16, f64)> {
         let mut buf = vec![0u64; 64];
         let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 8) };
         let Some(got) = query(h, StorageDeviceTemperatureProperty, bytes) else { return Vec::new() };
@@ -160,8 +162,22 @@ mod imp {
         let count = (d.InfoCount as usize).min((got - head) / std::mem::size_of::<STORAGE_TEMPERATURE_INFO>());
         (0..count)
             // SAFETY: bounded by the byte count the driver returned.
-            .map(|i| unsafe { (*first.add(i)).Temperature } as f64)
+            .map(|i| unsafe { ((*first.add(i)).Index, (*first.add(i)).Temperature as f64) })
             .collect()
+    }
+}
+
+/// A drive temperature's row name. NVMe drives report the controller's composite temperature at
+/// index 0 and each of their own sensors at its number (the NVMe health log's Composite
+/// Temperature and Temperature Sensor 1-8); HWiNFO shows the same three on a 990 PRO as
+/// "Drive Temperature", "2" and "3", which does not say which is which. Other buses keep the
+/// plain numbering by position.
+pub fn temperature_label(nvme: bool, position: usize, index: u16) -> String {
+    match (nvme, index) {
+        (true, 0) => "Composite Temperature".to_owned(),
+        (true, n @ 1..=8) => format!("Temperature Sensor {n}"),
+        _ if position == 0 => "Drive Temperature".to_owned(),
+        _ => format!("Drive Temperature {}", position + 1),
     }
 }
 
@@ -192,6 +208,7 @@ impl Drives {
                 number,
                 device: DeviceInfo::new(format!("drive{number}"), DeviceKind::Drive, name).detail(detail).order(number),
                 sensors: imp::temperatures(&h).len(),
+                nvme: id.bus == "NVMe",
             });
         }
         if drives.is_empty() {
@@ -245,9 +262,8 @@ impl Source for Drives {
             if d.sensors > 0
                 && let Some(h) = imp::open(d.number)
             {
-                for (i, t) in imp::temperatures(&h).into_iter().enumerate() {
-                    let label =
-                        if i == 0 { "Drive Temperature".to_owned() } else { format!("Drive Temperature {}", i + 1) };
+                for (i, (index, t)) in imp::temperatures(&h).into_iter().enumerate() {
+                    let label = temperature_label(d.nvme, i, index);
                     let t = if (-40.0..=150.0).contains(&t) && t != 0.0 { t } else { f64::NAN };
                     out.put(
                         &SensorInfo::new(&dev, format!("temp{i}"), Group::Temperatures, label, "°C", 0)
@@ -288,5 +304,16 @@ mod tests {
         assert_eq!(parse_disk_instance("1 D: E:"), Some((1, "D: E:".into())));
         assert_eq!(parse_disk_instance("_Total"), None);
         assert_eq!(bus_name(17), "NVMe");
+    }
+
+    #[test]
+    fn nvme_temperatures_are_named_as_the_health_log_names_them() {
+        assert_eq!(temperature_label(true, 0, 0), "Composite Temperature");
+        assert_eq!(temperature_label(true, 1, 1), "Temperature Sensor 1");
+        // The driver lists only the sensors a drive has: the index, not the position, names it.
+        assert_eq!(temperature_label(true, 1, 2), "Temperature Sensor 2");
+        assert_eq!(temperature_label(true, 3, 9), "Drive Temperature 4", "outside the log's 1-8");
+        assert_eq!(temperature_label(false, 0, 0), "Drive Temperature");
+        assert_eq!(temperature_label(false, 1, 1), "Drive Temperature 2");
     }
 }
