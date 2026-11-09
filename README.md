@@ -12,17 +12,23 @@ average** since the last reset. It is built from the telemetry of the other two 
   Windows performance counters and the WHEA error log.
 - **Roch GPU**'s vendor backends, used as they are: NVAPI/NVML for NVIDIA, ADL/ADLX for AMD and
   IGCL for Intel Arc, with Roch GPU's telemetry table's rows, names and units.
+- **Per-core readings the way HWiNFO shows them**, which neither Roch tool had: each core's
+  temperature, clock and VID and each thread's effective clock, read from the CPU's own registers
+  through PawnIO.
 
 Like both, it is **read-only**. It changes no setting, and the only writes anywhere are selectors
-that choose what the next read returns, each documented where it is made.
+that choose what the next read returns, each documented where it is made. The MSRs are only ever
+read.
 
 ## What it shows
 
 | Device | Readings | Source |
 | --- | --- | --- |
 | System | physical and virtual memory used, available, load | `GlobalMemoryStatusEx` |
+| CPU | per-core temperatures, clocks (ratio × bus clock) and VIDs; per-thread effective clocks; CPU Package; the DTS throttling, critical-temperature and power-limit flags | MSRs through PawnIO (Intel) |
+| CPU | per-thread effective clocks and per-core power (AMD Zen; not yet checked on AMD hardware) | MSRs through PawnIO |
 | CPU | Core Max (sampled every 200 ms for its peaks), package and IA-core power, VCCSA, VDDQ TX, bus and ring clock | MCHBAR |
-| CPU | average, per-thread and effective clocks, total and per-thread usage, labelled P-core/E-core | performance counters, `GetLogicalProcessorInformationEx` |
+| CPU | total and per-thread usage, labelled P-core/E-core; average, per-thread and effective clocks when PawnIO is not installed | performance counters, `GetLogicalProcessorInformationEx` |
 | Motherboard | temperatures, Vcore, SA, DRAM, CPU AUX, +12V/+5V/+3.3V, fan speeds and duty | Super I/O (Nuvoton NCT668x/NCT679x, ITE) |
 | Motherboard | VRM temperature (ASUS boards) | ACPI embedded controller |
 | Memory | data rate, MCLK, UCLK | MCHBAR |
@@ -41,7 +47,11 @@ number.
 MSI PRO Z790-P WIFI DDR4 (MS-7E06), Intel Core i9-14900KF, 2 × 16 GB G.Skill DDR4-3800,
 NVIDIA GeForce RTX 5060 Ti. Every source answers on that machine, and two independent instruments
 agree where they overlap: the MCHBAR's VCCSA (1.231 V) against the Super I/O's CPU SA (1.230 V), and
-the die's Core Max against the board's CPU thermistor.
+the die's Core Max against the board's CPU thermistor. The per-core MSR readings (PawnIO 2.2.0,
+IntelMSR 0.2.11) agree the same way: the hottest core's reading matches MCHBAR's Core Max, each
+core's VID (1.300 V) sits just under the Vcore the Super I/O measures (1.308 V), every core reads
+57 × 100.00 MHz against MCHBAR's bus clock, and a busy thread's effective clock follows its usage
+times that clock. A sweep of all 16 threads takes 0.3 ms.
 
 The Super I/O maps for the ASUS ROG MAXIMUS Z790 APEX (NCT6798D), the Gigabyte Z890 AORUS TACHYON
 ICE (ITE IT8696E + IT87952E) and the MSI B850MPOWER (NCT6687D on AM5), the ASUS EC map and the DDR5
@@ -114,9 +124,13 @@ RochMonitor.exe --help
   security software may warn about it; it is a well-known low-level access component and, for the
   same reason, one attackers have abused, so decide for yourself whether you want it on your
   machine.
-- **Administrator rights**, which the driver needs. The window asks for them when it starts.
+- **PawnIO** for the per-core temperatures, clocks and VIDs. Install it from its author's site,
+  https://pawnio.eu (the same driver LibreHardwareMonitor uses); Roch Monitor carries the two signed
+  modules it loads into it (`crates/roch-sensors/res/pawnio`) and calls only their MSR read. Without
+  it, the CPU's clocks come from the performance counters instead, and **Sources** says so.
+- **Administrator rights**, which both drivers need. The window asks for them when it starts.
   Declining is allowed: CPU clocks and usage, the GPU, drives, network and WHEA work without the
-  driver, and the window says what is missing and why.
+  drivers, and the window says what is missing and why.
 
 ## Build
 

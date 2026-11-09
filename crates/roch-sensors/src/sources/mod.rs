@@ -7,6 +7,7 @@ pub mod dimm;
 pub mod drives;
 pub mod gpu;
 pub mod intel_mchbar;
+pub mod msr;
 pub mod network;
 pub mod smbus;
 pub mod superio;
@@ -21,7 +22,8 @@ use crate::system::SystemInfo;
 /// Which optional sources to start.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// The board, DIMM, MCHBAR, SMU PM-table and EC transports, which need the inpoutx64 driver.
+    /// The board, DIMM, MCHBAR, SMU PM-table and EC transports, which need the inpoutx64 driver,
+    /// and the per-core MSRs, which need PawnIO.
     pub hardware: bool,
     pub gpu: bool,
     pub drives: bool,
@@ -51,11 +53,15 @@ pub fn factories(sys: &SystemInfo, options: Options) -> Vec<(String, Factory)> {
         let s = sys.clone();
         add("System", Box::new(move |_: &mut Batch| boxed(Some(system_usage::SystemUsage::new(&s)))));
     }
+    // Decided before anything starts, so the counter clocks know whether to stand aside.
+    let msr = options.hardware && msr::available(&sys);
     {
         let s = sys.clone();
-        add("CPU counters", Box::new(move |b: &mut Batch| boxed(cpu_load::CpuLoad::detect(&s, b))));
+        add("CPU counters", Box::new(move |b: &mut Batch| boxed(cpu_load::CpuLoad::detect(&s, b, !msr))));
     }
     if options.hardware {
+        let s = sys.clone();
+        add("Per-core MSRs", Box::new(move |b: &mut Batch| boxed(msr::CpuMsr::detect(&s, b))));
         let s = sys.clone();
         add("MCHBAR", Box::new(move |b: &mut Batch| boxed(intel_mchbar::IntelMchbar::detect(&s, b))));
         let s = sys.clone();

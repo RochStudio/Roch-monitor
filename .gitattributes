@@ -1,0 +1,5 @@
+# The PawnIO modules are blobs signed by their author: a single changed byte and the driver refuses
+# them, so line-ending conversion must never touch them. The icons likewise.
+*.bin binary
+*.ico binary
+*.png binary

@@ -9,6 +9,8 @@ pub struct CpuId {
     pub stepping: u32,
     /// Leaf 7 EDX bit 15: the part mixes performance and efficiency cores.
     pub hybrid: bool,
+    /// Leaf 0x16 ECX: the nominal bus (reference) clock in MHz, 0 where the leaf is missing.
+    pub bus_mhz: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,7 @@ impl CpuId {
         let family = if base_family == 0xF { base_family + ext_family } else { base_family };
         let model = if base_family == 0x6 || base_family == 0xF { (ext_model << 4) | base_model } else { base_model };
         let hybrid = l0.eax >= 7 && (leaf(7).edx >> 15) & 1 == 1;
+        let bus_mhz = if l0.eax >= 0x16 { leaf(0x16).ecx & 0xFFFF } else { 0 };
         let mut brand = Vec::with_capacity(48);
         if leaf(0x8000_0000).eax >= 0x8000_0004 {
             for l in 0x8000_0002..=0x8000_0004u32 {
@@ -55,6 +58,7 @@ impl CpuId {
             model,
             stepping: l1.eax & 0xF,
             hybrid,
+            bus_mhz,
         }
     }
 

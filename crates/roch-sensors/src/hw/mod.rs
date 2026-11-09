@@ -1,10 +1,11 @@
-//! The low-level access every transport is built on: the inpoutx64 driver, the shared bus
-//! mutexes, PCI configuration through ECAM, and the firmware tables.
+//! The low-level access every transport is built on: the inpoutx64 driver, PawnIO for the MSRs,
+//! the shared bus mutexes, PCI configuration through ECAM, and the firmware tables.
 
 pub mod cpuid;
 pub mod firmware;
 pub mod inpout;
 pub mod mutex;
+pub mod pawnio;
 pub mod pci;
 pub mod smbios;
 pub mod topology;

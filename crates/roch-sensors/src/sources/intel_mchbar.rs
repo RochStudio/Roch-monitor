@@ -7,6 +7,7 @@
 //!
 //! Read-only: physical reads, nothing else.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::engine::{Batch, Source};
@@ -48,6 +49,17 @@ const VDDQ_TX: (u64, u32, u32) = (0x5E00, 17, 10);
 
 const CPU: &str = "cpu";
 const MEMORY: &str = "memory";
+
+/// The bus clock this source last read, as f64 bits (zero until read), for the per-core MSR clocks
+/// (`msr`), which multiply each core's ratio by it. Measured here, where the alternatives are not:
+/// CPUID's is nominal, and the TSC on these parts runs off the 38.4 MHz crystal rather than BCLK.
+static MEASURED_BCLK: AtomicU64 = AtomicU64::new(0);
+
+/// The bus clock MCHBAR last reported, when this source is running and has read it.
+pub fn measured_bclk() -> Option<f64> {
+    let b = f64::from_bits(MEASURED_BCLK.load(Ordering::Relaxed));
+    (50.0..=300.0).contains(&b).then_some(b)
+}
 
 pub fn cpu_device(sys: &SystemInfo) -> DeviceInfo {
     let cores = sys.topology.cores;
@@ -225,6 +237,9 @@ impl Source for IntelMchbar {
         out.status(self.status.clone());
 
         let bclk = self.read(BCLK_KHZ).map(|v| v as f64 / 1000.0).filter(|b| (50.0..=300.0).contains(b));
+        if let Some(b) = bclk {
+            MEASURED_BCLK.store(b.to_bits(), Ordering::Relaxed);
+        }
         let b = bclk.unwrap_or(f64::NAN);
         out.put(&SensorInfo::new(CPU, "clk/bclk", Group::Clocks, "Bus Clock", "MHz", 2).source("MCHBAR 0x5F60"), b);
 

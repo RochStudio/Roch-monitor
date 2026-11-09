@@ -29,6 +29,21 @@ Those files are deliberately not included in this repository or in any build pro
 the reason Roch Viewer gives: they are third-party binaries under their own terms, and this project
 is GPL-3.0. Obtain them from the vendor and place them beside the executable yourself.
 
+## PawnIO modules (bundled) and the PawnIO driver (NOT distributed with this project)
+
+`crates/roch-sensors/res/pawnio/IntelMSR.bin` and `AMDFamily17.bin` are the compiled, signed modules
+from PawnIO.Modules by namazso (https://github.com/namazso/PawnIO.Modules), release 0.2.11, included
+byte for byte and compiled into the executable. They are licensed LGPL-2.1-or-later; the licence is in
+`crates/roch-sensors/res/pawnio/COPYING.LGPL-2.1`, and their source (`IntelMSR.p`, `AMDFamily17.p`) is
+in that repository at that release. `crates/roch-sensors/res/pawnio/README.md` records each file's
+sha256. They cannot be modified and still load: the driver accepts only modules signed by their author.
+
+The modules run inside the PawnIO driver (https://pawnio.eu), which the user installs from its
+author's own signed installer. The driver is not included in this repository or in any build produced
+from it. The calling convention in `crates/roch-sensors/src/hw/pawnio.rs` (the two IOCTLs and the
+execute buffer's layout) was written from PawnIO's public `pawnio_um.h` and `PawnIOLib.cpp`; no PawnIO
+source file is included.
+
 ## ZenStates-Core and ZenTimings (followed, not bundled)
 
 Copyright (c) irusanov, https://github.com/irusanov, GPL-3.0.
@@ -46,7 +61,8 @@ https://github.com/LibreHardwareMonitor/LibreHardwareMonitor, MPL-2.0.
 The NCT6687D's fan tachometer and duty registers (0x140, 0x160) and the dividers on its +12 V, +5 V
 and +3.3 V channels are the ones LibreHardwareMonitor documents for that chip. They were then read on
 the MSI Z790-P bench, where they land on 12.02, 5.01 and 3.35 V and on fan speeds that match the
-headers fitted. No LibreHardwareMonitor source is included.
+headers fitted. No LibreHardwareMonitor source is included. The per-core MSR source pins its thread to each logical
+processor before a read, as LibreHardwareMonitor does with the same PawnIO modules.
 
 ## Reference tools
 
