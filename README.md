@@ -160,7 +160,8 @@ With Rust stable:
 cargo build --release
 ```
 
-The executable is `target\release\RochMonitor.exe`. Run the tests with `cargo test`. Some tests read
+The executable is `target\release\RochMonitor.exe`. Pushing a tag named for the workspace version
+(`v1.0.0`) runs CI and publishes its package as a GitHub release. Run the tests with `cargo test`. Some tests read
 this machine's own counters and firmware tables; none needs the driver.
 
 ### Layout
