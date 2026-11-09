@@ -169,7 +169,7 @@ pub fn settings_font(size: f32, bold: bool) -> FontId {
 }
 
 /// Load the chosen family (its regular face, and its bold face for headings when it has one), with
-/// Consolas, Segoe UI Symbol (for ▸ ▾ ● · ☀ ☾) and egui's own fonts behind it. A file that cannot be
+/// Consolas, Segoe UI Symbol (for ▸ ▾ ● ·) and egui's own fonts behind it. A file that cannot be
 /// read is skipped; the window always has something to draw with.
 pub fn install_fonts(ctx: &Context, family: &str) {
     let mut fonts = FontDefinitions::default();
