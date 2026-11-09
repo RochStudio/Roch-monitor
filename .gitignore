@@ -1,0 +1,19 @@
+# build output
+/target/
+dist/
+
+# The low-level access driver is a third-party binary under its own terms and is never committed
+# (see THIRD-PARTY-NOTICES.md). Put it beside the built executable instead.
+inpoutx64.dll
+inpoutx64.sys
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.swp
+
+# local runtime artefacts
+*.log
+RochMonitor_*.csv
+RochMonitor_Report_*.txt

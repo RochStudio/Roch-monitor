@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/roch-core",
+    "crates/roch-nvidia",
+    "crates/roch-amd",
+    "crates/roch-intel",
+    "crates/roch-sensors",
+    "crates/roch-monitor",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+authors = ["Roch Studio"]
+repository = "https://github.com/RochStudio/Roch-monitor"
+
+[workspace.dependencies]
+# The GPU crates are vendored unchanged from Roch GPU (see crates/VENDORED.md); they keep their own
+# version numbers through `version.workspace`, which is why that key resolves here too.
+roch-core = { path = "crates/roch-core" }
+roch-nvidia = { path = "crates/roch-nvidia" }
+roch-amd = { path = "crates/roch-amd" }
+roch-intel = { path = "crates/roch-intel" }
+roch-sensors = { path = "crates/roch-sensors" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+sha2 = "0.10"
+libloading = "0.8"
+libc = "0.2"
+winreg = "0.55"
+windows-sys = { version = "0.59" }
+
+# Roch GPU's measured release profile: "s" + fat LTO came out smallest for a window that spends its
+# time waiting on drivers and vsync. panic stays "unwind" so a panicking driver call is caught by
+# its source's thread instead of taking every other sensor down with it.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
