@@ -31,6 +31,9 @@ struct Card {
     device: DeviceInfo,
     caps: GpuCapabilities,
     nvidia: bool,
+    /// The numbered clock domains seen running (at least [`DOMAIN_RUNNING_MHZ`]) at least once. One
+    /// that never has gets no row: the walk on a 5070 Ti carries type 31, which reads a flat 5 kHz.
+    ticking: std::collections::BTreeSet<i32>,
 }
 
 pub struct Gpus {
@@ -76,6 +79,7 @@ impl Gpus {
                                 .order(number as u32),
                             caps,
                             nvidia: vendor == "NVIDIA",
+                            ticking: Default::default(),
                         });
                     }
                     backends.push(backend);
@@ -95,6 +99,10 @@ impl Gpus {
     }
 }
 
+/// Below this a numbered clock domain is not running: every real one on a 5070 Ti is 100 MHz or more,
+/// and type 31 reads 0.005.
+const DOMAIN_RUNNING_MHZ: f64 = 1.0;
+
 fn mhz(v: f64) -> f64 {
     if v.is_finite() && v > 0.0 { v } else { f64::NAN }
 }
@@ -113,7 +121,7 @@ fn decimals_for(unit: &str) -> u8 {
     }
 }
 
-fn put_card(out: &mut Batch, card: &Card, t: &GpuTelemetry, extra: &std::collections::BTreeMap<String, f64>) {
+fn put_card(out: &mut Batch, card: &mut Card, t: &GpuTelemetry, extra: &std::collections::BTreeMap<String, f64>) {
     let dev = card.device.id.as_str();
     let s = |key: &str, group: Group, label: &str, unit: &str, decimals: u8| {
         SensorInfo::new(dev, key, group, label, unit, decimals)
@@ -171,6 +179,12 @@ fn put_card(out: &mut Batch, card: &Card, t: &GpuTelemetry, extra: &std::collect
         .collect();
     domains.sort_by_key(|d| d.0);
     for (n, v) in domains {
+        if v.is_finite() && v >= DOMAIN_RUNNING_MHZ {
+            card.ticking.insert(n);
+        }
+        if !card.ticking.contains(&n) {
+            continue;
+        }
         #[cfg(windows)]
         let label = roch_nvidia::domain_name(n);
         #[cfg(not(windows))]
@@ -228,7 +242,7 @@ impl Source for Gpus {
 
     fn poll(&mut self, out: &mut Batch) {
         out.status(self.status.clone());
-        for card in &self.cards {
+        for card in &mut self.cards {
             out.device(card.device.clone());
             let backend = &mut self.backends[card.backend];
             match backend.read_telemetry(card.index) {
@@ -248,12 +262,13 @@ mod tests {
 
     #[test]
     fn a_card_reports_only_what_it_has() {
-        let card = Card {
+        let mut card = Card {
             backend: 0,
             index: 0,
             device: DeviceInfo::new("gpu0", DeviceKind::Gpu, "Test"),
             caps: GpuCapabilities::default(),
             nvidia: false,
+            ticking: Default::default(),
         };
         let t = GpuTelemetry {
             temperature_c: 40.0,
@@ -265,7 +280,7 @@ mod tests {
             ..GpuTelemetry::default()
         };
         let mut b = Batch::default();
-        put_card(&mut b, &card, &t, &Default::default());
+        put_card(&mut b, &mut card, &t, &Default::default());
         let keys: Vec<&str> = b.sensors.iter().map(|s| s.key.as_str()).collect();
         assert!(keys.contains(&"gpu0/temp"));
         assert!(!keys.contains(&"gpu0/hotspot"), "a hot spot never set is not a reading: no row");
@@ -273,5 +288,35 @@ mod tests {
         assert!(keys.contains(&"gpu0/fan1"));
         let board = b.values.iter().find(|(k, _)| k == "gpu0/power/board").unwrap().1;
         assert!(board.is_nan(), "0 W is the backend's 'unavailable'");
+    }
+
+    #[test]
+    fn a_clock_domain_that_has_only_read_zero_gets_no_row() {
+        let mut card = Card {
+            backend: 0,
+            index: 0,
+            device: DeviceInfo::new("gpu0", DeviceKind::Gpu, "Test"),
+            caps: GpuCapabilities::default(),
+            nvidia: true,
+            ticking: Default::default(),
+        };
+        let t = GpuTelemetry::default();
+        let poll = |card: &mut Card, d3: f64, d31: f64| {
+            let extra = [("domain3".to_owned(), d3), ("domain31".to_owned(), d31)].into_iter().collect();
+            let mut b = Batch::default();
+            put_card(&mut b, card, &t, &extra);
+            b.values
+        };
+
+        for d31 in [0.0, 0.005] {
+            let first = poll(&mut card, 540.0, d31);
+            assert!(first.iter().any(|(k, v)| k == "gpu0/clk/domain3" && *v == 540.0));
+            assert!(!first.iter().any(|(k, _)| k == "gpu0/clk/domain31"), "{d31} MHz is not a running clock");
+        }
+
+        // Once it has run, it keeps its row, and a later zero is a reading.
+        poll(&mut card, 540.0, 120.0);
+        let later = poll(&mut card, 540.0, 0.0);
+        assert!(later.iter().any(|(k, v)| k == "gpu0/clk/domain31" && *v == 0.0));
     }
 }

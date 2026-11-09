@@ -34,6 +34,7 @@ use crate::hw::cpuid::Vendor;
 use crate::hw::inpout::driver;
 use crate::hw::mutex;
 use crate::hw::ports::Ports;
+use crate::hw::smbios::Smbios;
 use crate::model::{DeviceInfo, DeviceKind, Group, SensorInfo};
 use crate::system::SystemInfo;
 
@@ -200,6 +201,78 @@ struct Channel {
     note: &'static str,
 }
 
+/// The board a channel map was confirmed on. A map is picked by chip and CPU vendor, so another
+/// board with the same chip gets it too; that board's wiring may differ, and nothing in the
+/// readings would show it. So the map says where it was confirmed, and the board heading and
+/// Sources say when this is not that board.
+struct ConfirmedOn {
+    /// As people name it.
+    board: &'static str,
+    /// SMBIOS board or system product names that identify it, compared whole (ignoring case),
+    /// and also against either half of a "NAME (MS-XXXX)" product.
+    products: &'static [&'static str],
+}
+
+static NCT668X_INTEL_BOARD: ConfirmedOn =
+    ConfirmedOn { board: "MSI PRO Z790-P WIFI DDR4 (MS-7E06)", products: &["MS-7E06"] };
+static NCT668X_Z790MPOWER_BOARD: ConfirmedOn =
+    ConfirmedOn { board: "MSI Z790MPOWER (MS-7E01)", products: &["MS-7E01"] };
+static NCT668X_AMD_BOARD: ConfirmedOn = ConfirmedOn { board: "MSI B850MPOWER", products: &["B850MPOWER"] };
+static NCT679X_INTEL_BOARD: ConfirmedOn =
+    ConfirmedOn { board: "ASUS ROG MAXIMUS Z790 APEX", products: &["ROG MAXIMUS Z790 APEX"] };
+static ITE_INTEL_BOARD: ConfirmedOn =
+    ConfirmedOn { board: "Gigabyte Z890 AORUS TACHYON ICE", products: &["Z890 AORUS TACHYON ICE"] };
+
+/// The names this machine's SMBIOS gives its board: the board and system products, each whole and,
+/// for MSI's "Z790MPOWER (MS-7E01)", split into the name and the model code.
+fn product_names(smbios: &Smbios) -> Vec<String> {
+    let mut out = Vec::new();
+    for field in [&smbios.board_product, &smbios.system_product] {
+        let f = field.trim().to_uppercase();
+        if f.is_empty() {
+            continue;
+        }
+        if let (Some(open), Some(close)) = (f.find('('), f.rfind(')'))
+            && open < close
+        {
+            out.push(f[..open].trim().to_owned());
+            out.push(f[open + 1..close].trim().to_owned());
+        }
+        out.push(f);
+    }
+    out
+}
+
+impl ConfirmedOn {
+    fn matches(&self, smbios: &Smbios) -> bool {
+        let names = product_names(smbios);
+        self.products.iter().any(|p| names.iter().any(|n| n.eq_ignore_ascii_case(p)))
+    }
+
+    /// The board heading's note and the Sources sentence for a board the map was not confirmed
+    /// on; `None` on the board it was.
+    fn caveat(&self, smbios: &Smbios) -> Option<(String, String)> {
+        if self.matches(smbios) {
+            return None;
+        }
+        Some((
+            format!("map from {}, unconfirmed here", self.board),
+            format!(
+                " Channel map confirmed on the {}, not on this board: which reading is which rail is the board maker's wiring, so check them against another tool before relying on them.",
+                self.board
+            ),
+        ))
+    }
+}
+
+/// The board heading's detail and the Sources line, with the map's caveat where it applies.
+fn describe(chip: &str, status: String, confirmed: &ConfirmedOn, smbios: &Smbios) -> (String, String) {
+    match confirmed.caveat(smbios) {
+        Some((note, sentence)) => (format!("{chip} · {note}"), status + &sentence),
+        None => (chip.to_owned(), status),
+    }
+}
+
 const fn temp(key: &'static str, label: &'static str, address: u16, decode: Decode, band: (f64, f64)) -> Channel {
     Channel {
         key,
@@ -341,6 +414,64 @@ fn nct668x_intel() -> Vec<Channel> {
     v
 }
 
+/// MSI Z790MPOWER (MS-7E01), DDR5, NCT6687D at 0x4E, window 0x0A20. The PRO Z790-P's layout with
+/// one difference: the input that board feeds from its DRAM rail carries CPU VDD2 here, as DDR5
+/// modules make their own VDD and VDDQ on their PMICs (1.440 and 1.410 V on this machine, against
+/// 1.376 V on this input). Every channel matched against HWiNFO 8.50 reading the same chip on the
+/// same boot, idle and with the GPU loaded.
+fn nct668x_z790mpower() -> Vec<Channel> {
+    let mut v = vec![
+        temp("temp/cpu", "CPU", 0x100, Decode::TempWord, (-20.0, 120.0)),
+        temp("temp/system", "System", 0x102, Decode::TempWord, (-20.0, 100.0)),
+        temp("temp/vrm", "VRM MOS", 0x104, Decode::TempWord, (-20.0, 125.0)),
+        temp("temp/pch", "PCH", 0x106, Decode::TempWord, (-20.0, 120.0)),
+        temp("temp/socket", "CPU Socket", 0x108, Decode::TempWord, (-20.0, 120.0)),
+        noted(
+            volt("volt/vcore", "Vcore", 0x124, Decode::VoltWord(NCT668X_HALF), (0.40, 1.80)),
+            "HWiNFO Vcore 1.274, exact",
+        ),
+        noted(
+            volt("volt/sa", "CPU SA", 0x12A, Decode::VoltWord(NCT668X_HALF), (0.60, 1.70)),
+            "HWiNFO CPU SA 1.184, exact; 7 mV under the SA VID in HWiNFO too",
+        ),
+        noted(
+            volt("volt/vdd2", "CPU VDD2", 0x128, Decode::VoltWord(NCT668X_STEP), (0.90, 1.60)),
+            "HWiNFO CPU VDD2 1.376, exact; DRAM on the DDR4 PRO Z790-P",
+        ),
+        noted(
+            volt("volt/cpuaux", "CPU AUX", 0x12C, Decode::VoltWord(NCT668X_STEP), (0.80, 2.50)),
+            "HWiNFO CPU AUX 1.792, exact",
+        ),
+        noted(
+            volt("volt/12v", "+12V", 0x120, Decode::VoltWord(NCT668X_HALF * 12.0), (10.0, 14.0)),
+            "HWiNFO +12V 12.024, exact",
+        ),
+        noted(
+            volt("volt/5v", "+5V", 0x122, Decode::VoltWord(NCT668X_HALF * 5.0), (4.0, 6.0)),
+            "HWiNFO +5V 5.060, exact",
+        ),
+        noted(
+            volt("volt/3v3", "+3.3V", 0x130, Decode::VoltWord(NCT668X_HALF), (2.9, 3.7)),
+            "HWiNFO +3.3V 3.340, exact",
+        ),
+    ];
+    v.extend(NCT668X_FANS.iter().cloned());
+    v
+}
+
+/// The Nuvoton map for this board and chip, and where it was confirmed: a board's own map where
+/// one is confirmed, otherwise the chip family's first one, which the caveat then flags.
+fn nuvoton_map(family: Family, vendor: Vendor, smbios: &Smbios) -> (Vec<Channel>, &'static ConfirmedOn) {
+    match (family, vendor) {
+        (Family::Nct668x, Vendor::Amd) => (nct668x_amd(), &NCT668X_AMD_BOARD),
+        (Family::Nct668x, _) if NCT668X_Z790MPOWER_BOARD.matches(smbios) => {
+            (nct668x_z790mpower(), &NCT668X_Z790MPOWER_BOARD)
+        }
+        (Family::Nct668x, _) => (nct668x_intel(), &NCT668X_INTEL_BOARD),
+        (Family::Nct679x, _) => (nct679x_intel(), &NCT679X_INTEL_BOARD),
+    }
+}
+
 /// MSI B850MPOWER (AM5), NCT6687D at 0x4E, window 0x0A20. The three thermistors were each put
 /// through a full load cycle (CPU tracked Tctl within 0.5 °C); PCH (flat 29.0 through a 34 °C
 /// swing) and the socket (reads 0.0, header not populated) were left out. VDDIO was pinned by a
@@ -424,6 +555,8 @@ pub struct SuperIo {
     /// Fans seen turning at least once, by key.
     spun: std::collections::HashSet<&'static str>,
     device: DeviceInfo,
+    /// The chip as each reading's source names it ("Nuvoton NCT6687D"), without the map's caveat.
+    chip: String,
     status: String,
 }
 
@@ -510,18 +643,16 @@ impl SuperIo {
 
         if let Some((i, chip)) = nuvoton {
             let io = handles.swap_remove(i).1;
-            let channels = match (chip.family, vendor) {
-                (Family::Nct668x, Vendor::Amd) => nct668x_amd(),
-                (Family::Nct668x, _) => nct668x_intel(),
-                (Family::Nct679x, _) => nct679x_intel(),
-            };
-            let detail = format!("Nuvoton {}", chip.name);
+            let (channels, confirmed) = nuvoton_map(chip.family, vendor, &sys.smbios);
+            let name = format!("Nuvoton {}", chip.name);
             let status = format!(
                 "Super I/O: Nuvoton {} (0x{:04X}) at 0x{:02X}, sensor window 0x{:04X}, through {driver}.",
                 chip.name, chip.id, chip.port, chip.base
             );
+            let (detail, status) = describe(&name, status, confirmed, &sys.smbios);
             return Probe::Found(Box::new(SuperIo {
                 device: board_device(sys, &detail),
+                chip: name,
                 transport: Transport::Nuvoton(chip, io),
                 channels,
                 spun: Default::default(),
@@ -530,7 +661,7 @@ impl SuperIo {
         }
         if !ite.is_empty() {
             let names: Vec<&str> = ite.iter().map(|(_, c)| c.name).collect();
-            let detail = format!("ITE {}", names.join(" + "));
+            let name = format!("ITE {}", names.join(" + "));
             let where_: Vec<String> =
                 ite.iter().map(|(_, c)| format!("{} at 0x{:02X} window 0x{:04X}", c.name, c.port, c.base)).collect();
             let channels = ite_intel()
@@ -550,9 +681,12 @@ impl SuperIo {
                 chips.push((chip, handles.swap_remove(i).1));
             }
             chips.reverse();
+            let status = format!("Super I/O: {}, through {driver}.", where_.join(", "));
+            let (detail, status) = describe(&name, status, &ITE_INTEL_BOARD, &sys.smbios);
             return Probe::Found(Box::new(SuperIo {
                 device: board_device(sys, &detail),
-                status: format!("Super I/O: {}, through {driver}.", where_.join(", ")),
+                chip: name,
+                status,
                 transport: Transport::Ite(chips),
                 channels,
                 spun: Default::default(),
@@ -646,7 +780,7 @@ impl Source for SuperIo {
             out.status(format!("{} (bus busy: another tool held the ISA mutex, sample skipped)", self.status));
             return;
         };
-        let chip = self.device.detail.clone();
+        let chip = self.chip.clone();
         for (c, raw) in self.channels.iter().zip(raws) {
             let Some(raw) = raw else { continue };
             let mut value = decode(raw, c.decode);
@@ -713,6 +847,60 @@ mod tests {
         assert_eq!(nct679x_name(0xD42B), Some("NCT6798D"));
         assert_eq!(ite_name(0x8696).map(|c| c.0), Some("IT8696E"));
         assert_eq!(ite_name(0x8688), None);
+    }
+
+    fn board(board_product: &str, system_product: &str) -> Smbios {
+        Smbios { board_product: board_product.into(), system_product: system_product.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_map_knows_the_board_it_was_confirmed_on() {
+        // MSI writes "NAME (MS-XXXX)" on the board and the bare code as the system.
+        assert!(NCT668X_INTEL_BOARD.matches(&board("PRO Z790-P WIFI DDR4(MS-7E06)", "MS-7E06")));
+        assert!(NCT668X_INTEL_BOARD.matches(&board("pro z790-p wifi ddr4 (ms-7e06)", "")));
+        assert!(NCT668X_AMD_BOARD.matches(&board("B850MPOWER (MS-0000)", "MS-0000")));
+        assert!(NCT679X_INTEL_BOARD.matches(&board("ROG MAXIMUS Z790 APEX", "System Product Name")));
+        assert!(ITE_INTEL_BOARD.matches(&board("Z890 AORUS TACHYON ICE", "Z890 AORUS TACHYON ICE")));
+    }
+
+    #[test]
+    fn another_board_with_the_same_chip_is_told_the_map_is_borrowed() {
+        // The same NCT6687D, an MSI board no map was confirmed on: whole names only, so neither the
+        // code nor a longer name that contains the confirmed one passes.
+        let other = board("MAG Z790 TOMAHAWK WIFI (MS-7D91)", "MS-7D91");
+        let (channels, confirmed) = nuvoton_map(Family::Nct668x, Vendor::Intel, &other);
+        assert!(std::ptr::eq(confirmed, &NCT668X_INTEL_BOARD));
+        assert!(channels.iter().any(|c| c.key == "volt/dram"));
+        let (detail, status) = describe("Nuvoton NCT6687D", "Super I/O: found.".into(), confirmed, &other);
+        assert_eq!(detail, "Nuvoton NCT6687D · map from MSI PRO Z790-P WIFI DDR4 (MS-7E06), unconfirmed here");
+        assert!(status.starts_with("Super I/O: found. Channel map confirmed on the MSI PRO Z790-P"), "{status}");
+        assert!(!NCT679X_INTEL_BOARD.matches(&board("ROG MAXIMUS Z790 APEX ENCORE", "")));
+        assert!(!NCT668X_INTEL_BOARD.matches(&Smbios::default()), "an unnamed board is not the confirmed one");
+
+        let home = board("PRO Z790-P WIFI DDR4 (MS-7E06)", "MS-7E06");
+        let (detail, status) = describe("Nuvoton NCT6687D", "Super I/O: found.".into(), &NCT668X_INTEL_BOARD, &home);
+        assert_eq!((detail.as_str(), status.as_str()), ("Nuvoton NCT6687D", "Super I/O: found."));
+    }
+
+    #[test]
+    fn the_z790mpower_gets_its_own_map_with_vdd2_where_the_ddr4_board_has_dram() {
+        let z790m = board("Z790MPOWER (MS-7E01)", "MS-7E01");
+        let (channels, confirmed) = nuvoton_map(Family::Nct668x, Vendor::Intel, &z790m);
+        assert!(std::ptr::eq(confirmed, &NCT668X_Z790MPOWER_BOARD));
+        assert!(confirmed.caveat(&z790m).is_none(), "its own board: no caveat");
+        let vdd2 = channels.iter().find(|c| c.address == 0x128).unwrap();
+        assert_eq!((vdd2.key, vdd2.label), ("volt/vdd2", "CPU VDD2"));
+        assert!(!channels.iter().any(|c| c.key == "volt/dram"));
+        // HWiNFO's 1.376 V on that input, through the same decode.
+        assert!((decode(0x2B00, vdd2.decode) - 1.376).abs() < 0.001);
+        // Every other address is the PRO Z790-P's, with the same keys.
+        let pro: Vec<(&str, u16)> =
+            nct668x_intel().iter().filter(|c| c.address != 0x128).map(|c| (c.key, c.address)).collect();
+        let mine: Vec<(&str, u16)> =
+            channels.iter().filter(|c| c.address != 0x128).map(|c| (c.key, c.address)).collect();
+        assert_eq!(pro, mine);
+        // An AMD machine with the same board code still gets the AMD map.
+        assert!(std::ptr::eq(nuvoton_map(Family::Nct668x, Vendor::Amd, &z790m).1, &NCT668X_AMD_BOARD));
     }
 
     #[test]

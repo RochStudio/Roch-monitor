@@ -60,6 +60,16 @@ core's VID (1.300 V) sits just under the Vcore the Super I/O measures (1.308 V),
 57 × 100.00 MHz against MCHBAR's bus clock, and a busy thread's effective clock follows its usage
 times that clock. A sweep of all 16 threads takes 0.3 ms.
 
+The MSI Z790MPOWER (MS-7E01, Intel Core i5-14600KF, 2 × 16 GB DDR5-8000, RTX 5070 Ti) has a map of
+its own, checked against HWiNFO 8.50 on the same boot: every board temperature, rail and fan Roch
+Monitor shows reads the same there, the DIMMs' SPD hubs and PMICs agree, and HWiNFO's
+"Unknown Rail (D4)" and "(D6)" powers are the "Rail 212" and "Rail 214" currents times the 12 V
+input. It is the PRO Z790-P's layout except for one input, which carries CPU VDD2 on this DDR5
+board where the DDR4 one has DRAM.
+
+A board with a supported chip but no map of its own gets the nearest one, and its heading and
+**Sources** say which board that map was confirmed on.
+
 The Super I/O maps for the ASUS ROG MAXIMUS Z790 APEX (NCT6798D), the Gigabyte Z890 AORUS TACHYON
 ICE (ITE IT8696E + IT87952E) and the MSI B850MPOWER (NCT6687D on AM5), the ASUS EC map and the DDR5
 PMIC decode come from Roch Viewer, where each was confirmed on that board against HWiNFO. They have
