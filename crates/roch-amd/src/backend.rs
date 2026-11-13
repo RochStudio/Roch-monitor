@@ -833,6 +833,8 @@ impl GpuBackend for AmdBackend {
         let current_generation = pcie("adl:40");
         let current_width = pcie("adl:41");
         let maximum_generation = pcie("adl:58");
+        // The card's own link width, which no AMD interface reports at full power (see `pcie`).
+        let maximum_width = self.pnp_ids.get(gpu).and_then(|pnp| crate::pcie::max_link_width(pnp)).unwrap_or(0);
 
         // Device plus revision identifies the exact silicon cut. Unknown cards keep those fields
         // empty rather than borrowing a neighbouring model's unit counts.
@@ -848,7 +850,12 @@ impl GpuBackend for AmdBackend {
             memory_type: if !memory_type.is_empty() { memory_type } else { pick("GDDR6") },
             memory_vendor,
             bus_width: pick("256 bits"),
-            bus_interface: GpuIdentity::pcie_bus_interface(maximum_generation, 0, current_generation, current_width),
+            bus_interface: crate::pcie::bus_interface_text(
+                maximum_generation,
+                maximum_width,
+                current_generation,
+                current_width,
+            ),
             ..GpuGraphicsInfo::from_device(&device)
         }
     }

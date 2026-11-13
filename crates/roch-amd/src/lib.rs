@@ -5,6 +5,7 @@ pub mod adl;
 pub mod adlx;
 mod backend;
 pub mod mapper;
+pub mod pcie;
 pub mod pmlog;
 
 pub use adlx::{AdlxTelemetry, Metric};
