@@ -31,7 +31,9 @@ pub fn bus_interface_text(
 }
 
 /// The instance ID ADL reports for an adapter, and the same ID without a trailing "&NN" display
-/// suffix, which ADL appends for a card's further outputs ("...&00000009&02").
+/// suffix, which ADL appends for a card's further outputs ("...&00000009&02"). Only the
+/// Windows reader uses it, and the tests that pin it.
+#[cfg(any(windows, test))]
 fn instance_ids(pnp: &str) -> Vec<String> {
     let mut ids = vec![pnp.trim().to_string()];
     if let Some((stem, tail)) = pnp.trim().rsplit_once('&')
