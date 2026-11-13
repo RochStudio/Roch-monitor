@@ -979,6 +979,8 @@ impl GpuBackend for AmdBackend {
                 pm.entry(id).or_insert(value);
             }
         }
+        let device_id = self.pnp_ids.get(gpu).and_then(|p| parse_pnp_identity(p)).map_or(0, |i| i.0);
+        AmdTelemetryMapper::normalize_bus_speed(&mut pm, device_id);
         // A failed PMLog query must not prevent the independent ADLX fallback.
         let adlx = self.adlx.read(context, adapter);
         let mut t = AmdTelemetryMapper::map(&pm, &adlx);

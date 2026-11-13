@@ -306,6 +306,75 @@ pub const TEMPERATURE_MIN_C: f64 = 0.0;
 pub const TEMPERATURE_MAX_C: f64 = 125.0;
 
 // ---------------------------------------------------------------------------------------------
+// SVI3 current and power (HWiNFO's "(SVI3 TFN)" rows).
+
+/// sensor key -> offset. Each SVI3 rail is five dwords in the table: two voltages, the current,
+/// the power and the VRM temperature, the voltage and temperature halves of which are confirmed
+/// above. Located on the Gigabyte X870 AORUS TACHYON ICE + Ryzen 7 9850X3D, BIOS F4, the same
+/// 0x620105 table, by the table's own arithmetic as well as HWiNFO 8.52:
+///
+/// ```text
+///   VDDCR_SOC   1.2800 V x 11.7087 A = 14.9871 W, the dword at 0x0E0 to four places
+///   VDD_MISC    1.1000 V x  5.4628 A =  6.0091 W, 0x0F4 holds 6.0090
+///   VDDCR_VDD   0x0C8 follows TDC (0x024) through a one-core load, 16.7 -> 30.4 A against
+///               16.5 -> 29.6, and 0x0CC is it times the rail's voltage; HWiNFO's own pair is
+///               17.884 A against a TDC of 17.879
+/// ```
+pub static SVI3_OFFSETS: [(&str, u64); 6] = [
+    ("vdd_current", 0x0C8),
+    ("vdd_power", 0x0CC),
+    ("soc_current", 0x0DC),
+    ("soc_power", 0x0E0),
+    ("misc_current", 0x0F0),
+    ("misc_power", 0x0F4),
+];
+/// A current or power above this is a decode error on a desktop socket.
+pub const SVI3_MAX: f64 = 1000.0;
+
+// ---------------------------------------------------------------------------------------------
+// Per-core readings.
+
+/// Slots in each per-core block of the 0x620105 table: one per core of a single-CCD part.
+pub const CORE_SLOTS: usize = 8;
+/// The per-core blocks, each [`CORE_SLOTS`] floats, located on the same bench by loading one
+/// logical processor at a time: pinned to CPU 6, only slot 3 moved (temperature 30.3 -> 63.4 °C,
+/// the effective clock to 5.62 GHz and C0 to 100 %), and pinned to CPU 1, only slot 0, so slot n
+/// is physical core n. Idle, slot 0's temperature read 30.5 against HWiNFO's "Core Temperatures"
+/// 30.6, and the clocks 5.62 GHz against its "Core Clocks" 5609-5625 MHz. Tctl tracked the loaded
+/// core's slot within 0.1 °C both times.
+pub const OFFSET_CORE_VOLTAGE: u64 = 0x4D4;
+pub const OFFSET_CORE_TEMPERATURE: u64 = 0x4F4;
+/// GHz.
+pub const OFFSET_CORE_CLOCK: u64 = 0x514;
+/// Each core's share of the interval in C0 and in CC6, in percent. The two blocks sum to 100.000
+/// for every slot, and the one-core load put slot 3 at 100.0 and 0.0 (slot 0 when CPU 1 was
+/// loaded) while the idle cores sat at 0.3-8 % and 92-99.7 %, as HWiNFO's C-State Residency does.
+pub const OFFSET_CORE_C0: u64 = 0x554;
+pub const OFFSET_CORE_CC6: u64 = 0x574;
+pub const CORE_VOLTAGE_BAND: (f64, f64) = (0.2, 1.8);
+/// MHz, after the table's GHz is scaled.
+pub const CORE_CLOCK_BAND: (f64, f64) = (400.0, 7000.0);
+
+/// One core's slot: each reading is `None` where it did not decode inside its band, as a slot
+/// past the last core of a six-core part reads zero.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct CoreSample {
+    pub temperature: Option<f64>,
+    pub voltage: Option<f64>,
+    pub clock_mhz: Option<f64>,
+    /// Percent of the interval in C0 and in CC6. Zero is a real residency, so these are kept only
+    /// for a slot whose temperature shows a core is there.
+    pub c0: Option<f64>,
+    pub cc6: Option<f64>,
+}
+
+impl CoreSample {
+    fn is_empty(&self) -> bool {
+        self.temperature.is_none() && self.voltage.is_none() && self.clock_mhz.is_none() && self.c0.is_none()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Decoding.
 
 /// Table reads by absolute physical address. `None` is a read the driver refused.
@@ -416,6 +485,38 @@ pub fn decode_temperatures(
         .collect()
 }
 
+/// The SVI3 currents (A) and powers (W) among `offsets` that decode above zero and inside
+/// [`SVI3_MAX`]. Zero is left out: a live rail always draws something, and an unwritten dword is 0.
+pub fn decode_svi3(read: TableRead<'_>, base: u64, offsets: &[(&'static str, u64)]) -> BTreeMap<&'static str, f64> {
+    offsets
+        .iter()
+        .filter_map(|&(key, offset)| {
+            let value = table_float(read, base, offset)?;
+            (value > 0.0 && value <= SVI3_MAX).then_some((key, value))
+        })
+        .collect()
+}
+
+/// Each core slot's temperature, voltage and clock, each kept only inside its band.
+pub fn decode_cores(read: TableRead<'_>, base: u64) -> Vec<CoreSample> {
+    let inside = |value: f64, (low, high): (f64, f64)| (low..=high).contains(&value).then_some(value);
+    (0..CORE_SLOTS as u64)
+        .map(|slot| {
+            let at = |offset: u64| table_float(read, base, offset + 4 * slot);
+            // Above zero, not from it: an absent core's slot holds exactly 0.0.
+            let temperature = at(OFFSET_CORE_TEMPERATURE).filter(|&c| c > TEMPERATURE_MIN_C && c <= TEMPERATURE_MAX_C);
+            let residency = |offset: u64| temperature.and(at(offset)).and_then(|p| inside(p, (0.0, 100.0)));
+            CoreSample {
+                temperature,
+                voltage: at(OFFSET_CORE_VOLTAGE).and_then(|v| inside(v, CORE_VOLTAGE_BAND)),
+                clock_mhz: at(OFFSET_CORE_CLOCK).and_then(|ghz| inside(ghz * 1000.0, CORE_CLOCK_BAND)),
+                c0: residency(OFFSET_CORE_C0),
+                cc6: residency(OFFSET_CORE_CC6),
+            }
+        })
+        .collect()
+}
+
 /// What one run read.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Snapshot {
@@ -428,6 +529,10 @@ pub struct Snapshot {
     pub power: BTreeMap<&'static str, f64>,
     pub limits: BTreeMap<&'static str, f64>,
     pub temperatures: BTreeMap<&'static str, f64>,
+    /// SVI3 currents and powers by [`SVI3_OFFSETS`] key.
+    pub svi3: BTreeMap<&'static str, f64>,
+    /// One entry per core slot, empty when the table was not trusted for them.
+    pub cores: Vec<CoreSample>,
 }
 
 impl Snapshot {
@@ -437,6 +542,13 @@ impl Snapshot {
             && self.power.is_empty()
             && self.limits.is_empty()
             && self.temperatures.is_empty()
+            && self.svi3.is_empty()
+            && self.cores.iter().all(CoreSample::is_empty)
+    }
+
+    /// Cores whose slot decoded anything.
+    fn core_count(&self) -> usize {
+        self.cores.iter().filter(|c| !c.is_empty()).count()
     }
 }
 
@@ -446,11 +558,9 @@ pub fn decode_table(read: TableRead<'_>, version: u32, base: u64) -> Snapshot {
     // Temperatures ride on the power figures, as they do in Roch Viewer's reader: a table in which
     // no power figure is believable is not trusted for temperatures, whose band includes the 0.0
     // an unwritten table holds.
-    let temperatures = if power.is_empty() && limits.is_empty() {
-        BTreeMap::new()
-    } else {
-        decode_temperatures(read, base, &TEMPERATURE_OFFSETS)
-    };
+    // The SVI3 figures and the per-core blocks ride on them the same way.
+    let trusted = !(power.is_empty() && limits.is_empty());
+    let temperatures = if trusted { decode_temperatures(read, base, &TEMPERATURE_OFFSETS) } else { BTreeMap::new() };
     Snapshot {
         version,
         base,
@@ -459,7 +569,37 @@ pub fn decode_table(read: TableRead<'_>, version: u32, base: u64) -> Snapshot {
         power,
         limits,
         temperatures,
+        svi3: if trusted { decode_svi3(read, base, &SVI3_OFFSETS) } else { BTreeMap::new() },
+        cores: if trusted { decode_cores(read, base) } else { Vec::new() },
     }
+}
+
+/// A table already copied out of DRAM (PawnIO's RyzenSMU hands it over whole, as qwords), read
+/// as the decoders read physical memory: by absolute address, `None` outside the copy.
+pub fn copied_table(base: u64, qwords: &[u64]) -> impl Fn(u64) -> Option<u32> + '_ {
+    move |address: u64| {
+        let offset = address.checked_sub(base)?;
+        if offset % 4 != 0 || offset >= PM_TABLE_LENGTH {
+            return None;
+        }
+        let dword = (offset / 4) as usize;
+        let qword = *qwords.get(dword / 2)?;
+        Some(if dword.is_multiple_of(2) { qword as u32 } else { (qword >> 32) as u32 })
+    }
+}
+
+/// One run through PawnIO's RyzenSMU: the module's answers for (version, base), then the table it
+/// copied. The same version gate and base bounds as the mailbox run, before anything is decoded.
+pub fn decode_copied_table(version: u32, base: u64, qwords: &[u64]) -> Result<Snapshot, RsmuError> {
+    if version != EXPECTED_TABLE_VERSION {
+        return Err(RsmuError::Version(version));
+    }
+    let base = check_table_base(base)?;
+    let snapshot = decode_table(&copied_table(base, qwords), version, base);
+    if snapshot.is_empty() {
+        return Err(RsmuError::Nothing);
+    }
+    Ok(snapshot)
 }
 
 /// Roch Viewer's bounds on the address firmware gives: not zero, not all ones, and the whole table
@@ -523,6 +663,8 @@ pub enum RsmuError {
     Base(u64),
     /// The table was transferred, and nothing in it decoded inside its band.
     Nothing,
+    /// PawnIO's RyzenSMU module refused a call (the Win32 error it came back as).
+    Module(&'static str, u32),
 }
 
 impl From<SmnError> for RsmuError {
@@ -546,6 +688,7 @@ impl std::fmt::Display for RsmuError {
             }
             RsmuError::Base(b) => write!(f, "firmware returned an impossible PM-table base 0x{b:X}"),
             RsmuError::Nothing => write!(f, "no reading in the PM table decoded inside its band"),
+            RsmuError::Module(call, e) => write!(f, "PawnIO's RyzenSMU module refused {call} (error {e})"),
         }
     }
 }
@@ -767,6 +910,78 @@ static TEMPERATURE_ROWS: [(&str, &str, &str); 8] = [
     ("misc_vrm", "temp/vrm_misc", "VDD_MISC VRM"),
 ];
 
+/// How a per-core family's heading row sums up its cores.
+#[derive(Clone, Copy)]
+enum Summary {
+    Mean,
+    Max,
+}
+
+fn summarise(values: &[f64], how: Summary) -> Option<f64> {
+    let finite: Vec<f64> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
+        return None;
+    }
+    Some(match how {
+        Summary::Mean => finite.iter().sum::<f64>() / finite.len() as f64,
+        Summary::Max => finite.iter().copied().fold(f64::MIN, f64::max),
+    })
+}
+
+/// One per-core block: a heading row summing it up, and a row per core folded under it.
+fn core_family(
+    rows: &mut Vec<(SensorInfo, Option<f64>)>,
+    s: Option<&Snapshot>,
+    (key, group, label, unit, decimals): (&str, Group, &str, &str, u8),
+    child_suffix: &str,
+    offset: u64,
+    how: Summary,
+    pick: fn(&CoreSample) -> Option<f64>,
+) {
+    let values: Vec<f64> =
+        (0..CORE_SLOTS).map(|c| s.and_then(|s| s.cores.get(c)).and_then(pick).unwrap_or(f64::NAN)).collect();
+    let parent = SensorInfo::new(CPU, format!("{key}s"), group, label, unit, decimals)
+        .source(format!("{}, one float per core", table_source(offset)));
+    let parent_key = parent.key.clone();
+    rows.push((parent, summarise(&values, how)));
+    for (c, value) in values.iter().enumerate() {
+        rows.push((
+            SensorInfo::new(CPU, format!("{key}{c}"), group, format!("Core {c}{child_suffix}"), unit, decimals)
+                .parent(parent_key.clone())
+                .source(table_source(offset + 4 * c as u64)),
+            value.is_finite().then_some(*value),
+        ));
+    }
+}
+
+/// How much of each budget is in use, as HWiNFO's "CPU PPT Limit", "CPU TDC Limit", "CPU EDC
+/// Limit" and "Thermal Limit" percentages show it: (key, row key, label, source).
+static LIMIT_USED_ROWS: [(&str, &str, &str, &str); 4] = [
+    ("ppt", "limit/ppt", "PPT Limit Used", "PPT over PPT Limit, both from the PM table"),
+    ("tdc", "limit/tdc", "TDC Limit Used", "TDC over TDC Limit, both from the PM table"),
+    ("edc", "limit/edc", "EDC Limit Used", "EDC over EDC Limit, both from the PM table"),
+    ("thermal", "limit/thermal", "Thermal Limit Used", "Tctl over the limit it is held to, both from the PM table"),
+];
+
+/// One budget's use in percent: the reading over its limit, `None` without both or a zero limit.
+pub fn limit_used(s: &Snapshot, key: &str) -> Option<f64> {
+    let (value, limit) = match key {
+        "thermal" => (s.temperatures.get("cpu")?, s.temperatures.get("cpu_limit")?),
+        metric => (s.power.get(metric)?, s.limits.get(metric)?),
+    };
+    (*limit > 0.0).then(|| value / limit * 100.0)
+}
+
+/// SVI3 rows: (snapshot key, row key, group, label, unit).
+static SVI3_ROWS: [(&str, &str, Group, &str, &str); 6] = [
+    ("vdd_current", "current/svi3_vdd", Group::Current, "VDDCR_VDD Current", "A"),
+    ("soc_current", "current/svi3_soc", Group::Current, "VDDCR_SOC Current", "A"),
+    ("misc_current", "current/svi3_misc", Group::Current, "VDD_MISC Current", "A"),
+    ("vdd_power", "power/svi3_vdd", Group::Power, "VDDCR_VDD Power", "W"),
+    ("soc_power", "power/svi3_soc", Group::Power, "VDDCR_SOC Power", "W"),
+    ("misc_power", "power/svi3_misc", Group::Power, "VDD_MISC Power", "W"),
+];
+
 /// Every row this source can show, with this snapshot's reading for it.
 fn rows(s: Option<&Snapshot>) -> Vec<(SensorInfo, Option<f64>)> {
     let mut rows = Vec::new();
@@ -780,6 +995,15 @@ fn rows(s: Option<&Snapshot>) -> Vec<(SensorInfo, Option<f64>)> {
             s.and_then(|s| s.temperatures.get(key).copied()),
         ));
     }
+    core_family(
+        &mut rows,
+        s,
+        ("temp/pm-core", Group::Temperatures, "Core Temperatures (avg)", "°C", 1),
+        "",
+        OFFSET_CORE_TEMPERATURE,
+        Summary::Mean,
+        |c| c.temperature,
+    );
     for rail in RAILS.iter().filter(|r| r.source == RailSource::PmTable) {
         let slug = rail.label.to_lowercase().replace(' ', "_");
         rows.push((
@@ -788,6 +1012,42 @@ fn rows(s: Option<&Snapshot>) -> Vec<(SensorInfo, Option<f64>)> {
             s.and_then(|s| s.voltages.get(rail.key).copied()),
         ));
     }
+    core_family(
+        &mut rows,
+        s,
+        ("volt/pm-core", Group::Voltages, "Core Voltages (max)", "V", VOLT_DECIMALS),
+        " Voltage",
+        OFFSET_CORE_VOLTAGE,
+        Summary::Max,
+        |c| c.voltage,
+    );
+    core_family(
+        &mut rows,
+        s,
+        ("clk/pm-core", Group::Clocks, "Core Clocks (avg)", "MHz", 0),
+        " Clock",
+        OFFSET_CORE_CLOCK,
+        Summary::Mean,
+        |c| c.clock_mhz,
+    );
+    core_family(
+        &mut rows,
+        s,
+        ("load/pm-c0-core", Group::Load, "Core C0 Residency (avg)", "%", 1),
+        " C0",
+        OFFSET_CORE_C0,
+        Summary::Mean,
+        |c| c.c0,
+    );
+    core_family(
+        &mut rows,
+        s,
+        ("load/pm-cc6-core", Group::Load, "Core CC6 Residency (avg)", "%", 1),
+        " CC6",
+        OFFSET_CORE_CC6,
+        Summary::Mean,
+        |c| c.cc6,
+    );
     rows.push((
         SensorInfo::new(CPU, "clk/fclk", Group::Clocks, "Infinity Fabric Clock (FCLK)", "MHz", 0)
             .source(table_source(OFFSET_FCLK)),
@@ -819,6 +1079,27 @@ fn rows(s: Option<&Snapshot>) -> Vec<(SensorInfo, Option<f64>)> {
             s.and_then(|s| s.limits.get(key).copied()),
         ));
     }
+    for (key, row, label, source) in LIMIT_USED_ROWS {
+        rows.push((
+            SensorInfo::new(CPU, row, Group::Limiters, label, "%", 1).source(source),
+            s.and_then(|s| limit_used(s, key)),
+        ));
+    }
+    for (key, row, group, label, unit) in SVI3_ROWS {
+        rows.push((
+            SensorInfo::new(CPU, row, group, label, unit, 3)
+                .source(format!("{}, SVI3 telemetry", table_source(offset_of(&SVI3_OFFSETS, key)))),
+            s.and_then(|s| s.svi3.get(key).copied()),
+        ));
+    }
+    // HWiNFO's "Core+SoC+MISC Power (SVI3 TFN)": only when all three rails answered.
+    let total =
+        s.and_then(|s| ["vdd_power", "soc_power", "misc_power"].iter().map(|k| s.svi3.get(k)).sum::<Option<f64>>());
+    rows.push((
+        SensorInfo::new(CPU, "power/svi3_total", Group::Power, "VDD + SOC + MISC Power", "W", 3)
+            .source("The three SVI3 rail powers summed"),
+        total,
+    ));
     if let Some(m) = metric("scalar") {
         rows.push((
             SensorInfo::new(CPU, "power/scalar", Group::Other, "PBO Scalar", m.unit, m.decimals)
@@ -829,20 +1110,42 @@ fn rows(s: Option<&Snapshot>) -> Vec<(SensorInfo, Option<f64>)> {
     rows
 }
 
-fn describe(s: &Snapshot) -> String {
+fn describe(s: &Snapshot, through: &str) -> String {
     format!(
-        "RSMU PM table 0x{:06X} at 0x{:X}: {} temperatures, {} power and current figures, {} rails{}.",
+        "{through} PM table 0x{:06X} at 0x{:X}: {} temperatures, {} power and current figures, {} rails, {} SVI3 figures, {} cores{}.",
         s.version,
         s.base,
         s.temperatures.len(),
         s.power.len() + s.limits.len(),
         s.voltages.len(),
+        s.svi3.len(),
+        s.core_count(),
         if s.clocks.is_some() { ", FCLK/UCLK" } else { "" }
     )
 }
 
+/// Which driver reaches the table.
+enum Transport {
+    /// PawnIO's RyzenSMU module, loaded from the PawnIO installation. The module runs the mailbox
+    /// and copies the table out; the PBO scalar, which has its own message, is not asked for.
+    #[cfg(windows)]
+    PawnIo(crate::hw::pawnio::RyzenSmu),
+    /// The RSMU mailbox through SMN, and the table by physical address.
+    InpOut(&'static InpOut),
+}
+
+impl Transport {
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(windows)]
+            Transport::PawnIo(_) => "PawnIO RyzenSMU",
+            Transport::InpOut(_) => "RSMU",
+        }
+    }
+}
+
 pub struct AmdSmu {
-    driver: &'static InpOut,
+    transport: Transport,
     cpu: DeviceInfo,
     clock: WallClock,
     last_run: Instant,
@@ -850,28 +1153,61 @@ pub struct AmdSmu {
     stopped: bool,
 }
 
+/// What trying one transport came to.
+enum Tried {
+    Found(Box<AmdSmu>),
+    /// Final: nothing another driver reads would change it (the table's version, above all).
+    Stop(String),
+    /// This transport did not work; the next may.
+    Next(String),
+}
+
 impl AmdSmu {
+    /// PawnIO's RyzenSMU first, where PawnIO is installed and carries the module: it reads the same
+    /// table at the same address, and keeps inpoutx64's unrestricted physical access out of this
+    /// process. Run side by side with the mailbox path on the X870 bench, both read table 0x620105 at
+    /// 0x83EE80000, and the limits, FCLK/UCLK and rail voltages came out identical. inpoutx64, as
+    /// confirmed on the B850M bench, where PawnIO cannot serve it.
     pub fn detect(sys: &SystemInfo, out: &mut Batch, driver_choice: crate::hw::Driver) -> Option<AmdSmu> {
         if let Err(why) = cpu_gate(sys) {
             out.status(why);
             return None;
         }
-        // PawnIO's RyzenSMU module would serve this too, but its mailbox sequence has not been
-        // run against the B850M bench these offsets were confirmed on, so the table is still read
-        // the way it was confirmed: through inpoutx64.
-        if !driver_choice.inpout() {
-            out.status("SMU PM table: read through inpoutx64 only, which --driver pawnio rules out.");
-            return None;
-        }
-        let driver = match driver() {
-            Ok(io) => io,
-            Err(e) => {
-                out.status(format!("SMU PM table unavailable: {e}"));
-                return None;
+        let mut unavailable = Vec::new();
+        #[cfg(windows)]
+        if driver_choice.pawnio() {
+            match crate::hw::pawnio::RyzenSmu::open() {
+                Ok(module) => match Self::attempt(sys, out, Transport::PawnIo(module)) {
+                    Tried::Found(smu) => return Some(*smu),
+                    Tried::Stop(why) => {
+                        out.status(why);
+                        return None;
+                    }
+                    Tried::Next(why) => unavailable.push(why),
+                },
+                Err(e) => unavailable.push(e),
             }
-        };
+        }
+        if driver_choice.inpout() {
+            match driver() {
+                Ok(io) => match Self::attempt(sys, out, Transport::InpOut(io)) {
+                    Tried::Found(smu) => return Some(*smu),
+                    Tried::Stop(why) | Tried::Next(why) => {
+                        out.status(why);
+                        return None;
+                    }
+                },
+                Err(e) => unavailable.push(e.to_owned()),
+            }
+        }
+        out.status(format!("SMU PM table unavailable: {}.", unavailable.join("; ")));
+        None
+    }
+
+    fn attempt(sys: &SystemInfo, out: &mut Batch, transport: Transport) -> Tried {
+        let through = transport.name();
         let mut smu = AmdSmu {
-            driver,
+            transport,
             cpu: cpu_device(sys),
             clock: WallClock::new(),
             last_run: Instant::now(),
@@ -886,25 +1222,46 @@ impl AmdSmu {
             match smu.run() {
                 Ok(snapshot) => {
                     smu.publish(out, Some(&snapshot));
-                    return Some(smu);
+                    return Tried::Found(Box::new(smu));
                 }
                 Err(e) if e.is_final() => {
-                    out.status(format!("SMU PM table: {e}. Nothing was decoded, and the mailbox is not asked again."));
-                    return None;
+                    return Tried::Stop(format!(
+                        "SMU PM table ({through}): {e}. Nothing was decoded, and the table is not asked for again."
+                    ));
                 }
                 Err(e) => last = Some(e),
             }
         }
         let why = last.map_or_else(String::new, |e| e.to_string());
-        out.status(format!("SMU PM table: {why} ({ATTEMPTS} attempts); not asked again this session."));
-        None
+        Tried::Next(format!("SMU PM table ({through}): {why} ({ATTEMPTS} attempts); not asked again this session"))
     }
 
     fn run(&mut self) -> Result<Snapshot, RsmuError> {
         self.last_run = Instant::now();
-        let driver = self.driver;
-        let clock = &self.clock;
-        pci::amd_smn(|smn| read_pm_table(smn, clock, &|address| driver.phys_read32(address)))
+        match &self.transport {
+            #[cfg(windows)]
+            Transport::PawnIo(module) => {
+                // Under the PCI mutex, as the mailbox path is: the module drives the same RSMU
+                // mailbox HWiNFO and ZenTimings take turns on.
+                let _bus =
+                    crate::hw::mutex::pci().lock(crate::hw::mutex::WAIT_MS).ok_or(RsmuError::Smn(SmnError::Busy))?;
+                let (version, base) =
+                    module.resolve_pm_table().map_err(|e| RsmuError::Module("ioctl_resolve_pm_table", e))?;
+                if version != EXPECTED_TABLE_VERSION {
+                    return Err(RsmuError::Version(version));
+                }
+                module.update_pm_table().map_err(|e| RsmuError::Module("ioctl_update_pm_table", e))?;
+                let table = module
+                    .read_pm_table(PM_TABLE_LENGTH as usize)
+                    .map_err(|e| RsmuError::Module("ioctl_read_pm_table", e))?;
+                decode_copied_table(version, base, &table)
+            }
+            Transport::InpOut(driver) => {
+                let driver = *driver;
+                let clock = &self.clock;
+                pci::amd_smn(|smn| read_pm_table(smn, clock, &|address| driver.phys_read32(address)))
+            }
+        }
     }
 
     /// Readings for every row that has one; NaN for rows already shown that this run missed. A
@@ -918,7 +1275,7 @@ impl AmdSmu {
             }
         }
         if let Some(s) = snapshot {
-            self.status = describe(s);
+            self.status = describe(s, self.transport.name());
         }
         out.status(self.status.clone());
     }
@@ -1336,9 +1693,13 @@ mod tests {
         let keys: HashSet<&str> = full.iter().map(|(i, _)| i.key.as_str()).collect();
         assert_eq!(keys.len(), full.len());
         assert!(full.iter().all(|(i, _)| i.device == CPU && i.key.starts_with("cpu/")));
-        // 8 temperatures, 6 rails, 2 clocks, 3 figures and 3 limits, the scalar.
-        assert_eq!(full.len(), 23);
-        assert!(full.iter().all(|(_, v)| v.is_some()), "the bench table fills every row");
+        // 8 temperatures, 6 rails, 2 clocks, 3 figures and 3 limits, the scalar: what the B850M
+        // capture holds. Beside them, three per-core blocks (a heading and a row per slot), the
+        // six SVI3 figures and their total, which that capture does not carry.
+        // Then the two residency blocks, and the four limit percentages, which that capture fills.
+        assert_eq!(full.len(), 23 + 5 * (1 + CORE_SLOTS) + 7 + 4);
+        let filled = full.iter().filter(|(_, v)| v.is_some()).count();
+        assert_eq!(filled, 23 + 4, "the bench table fills every row it holds");
         assert!(rows(None).iter().all(|(_, v)| v.is_none()));
         let labels: Vec<&str> = full.iter().map(|(i, _)| i.label.as_str()).collect();
         for wanted in ["CPU (Tctl)", "Thermal Limit", "PPT", "PPT Limit", "TDC", "EDC Limit", "VDDP", "VDDG CCD"] {
@@ -1816,5 +2177,158 @@ mod tests {
     #[test]
     fn decode_voltages_survives_a_failing_read() {
         assert!(decode_voltages(&|_| None, 0, &[("vddio_mem", 0x10)]).is_empty());
+    }
+
+    // -- The SVI3 rows and per-core blocks, from the X870 bench's PawnIO capture of 0x620105.
+
+    /// The bench's idle table at the offsets these tests read, as qwords the way RyzenSMU hands
+    /// the table over.
+    fn x870_capture() -> Vec<u64> {
+        let mut dwords = vec![0u32; (PM_TABLE_LENGTH as usize).div_ceil(4)];
+        let mut put = |offset: u64, value: f64| dwords[offset as usize / 4] = dword(value);
+        for (offset, value) in [
+            (0x008, 810.0),
+            (0x00C, 57.9091),
+            (0x020, 540.0),
+            (0x024, 22.0701),
+            (0x028, 95.0),
+            (0x02C, 42.078),
+            (0x0FC, 720.0),
+            (0x100, 37.25),
+            (0x0C4, 1.3686),
+            (0x0C8, 22.4457),
+            (0x0CC, 30.773),
+            (0x0D8, 1.28),
+            (0x0DC, 11.7087),
+            (0x0E0, 14.9871),
+            (0x0E8, 1.10),
+            (0x0F0, 5.4628),
+            (0x0F4, 6.009),
+            (0x11C, 2133.3335),
+            (0x12C, 3200.0),
+            (0x13C, 3200.0),
+        ] {
+            put(offset, value);
+        }
+        let temperatures = [30.5326, 36.5891, 31.175, 31.7098, 31.3772, 31.0511, 30.2696, 33.1663];
+        let voltages = [1.2957, 1.2683, 1.3017, 1.2518, 1.3047, 1.2896, 1.3286, 1.3498];
+        for core in 0..CORE_SLOTS {
+            let at = 4 * core as u64;
+            put(OFFSET_CORE_TEMPERATURE + at, temperatures[core]);
+            put(OFFSET_CORE_VOLTAGE + at, voltages[core]);
+            put(OFFSET_CORE_CLOCK + at, 5.6216);
+            // The idle residencies off the same capture: C0 and CC6 sum to 100 per core.
+            let c0 = [1.4248, 47.6546, 3.8106, 3.9721, 5.2521, 1.7391, 1.4072, 23.2709][core];
+            put(OFFSET_CORE_C0 + at, c0);
+            put(OFFSET_CORE_CC6 + at, 100.0 - c0);
+        }
+        dwords.chunks(2).map(|p| p[0] as u64 | (*p.get(1).unwrap_or(&0) as u64) << 32).collect()
+    }
+
+    const X870_BASE: u64 = 0x8_3EE8_0000;
+
+    #[test]
+    fn a_copied_table_reads_by_absolute_address() {
+        let qwords = [0x1111_1111_2222_2222u64, 0x3333_3333_4444_4444];
+        let read = copied_table(0x1000, &qwords);
+        assert_eq!(read(0x1000), Some(0x2222_2222));
+        assert_eq!(read(0x1004), Some(0x1111_1111));
+        assert_eq!(read(0x100C), Some(0x3333_3333));
+        assert_eq!(read(0x1010), None, "past what was copied");
+        assert_eq!(read(0x0FFC), None, "below the base");
+        assert_eq!(read(0x1002), None, "not a dword boundary");
+        assert_eq!(read(0x1000 + PM_TABLE_LENGTH), None, "past the table");
+    }
+
+    #[test]
+    fn the_svi3_figures_are_each_rail_s_current_and_power() {
+        let s = decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &x870_capture()).unwrap();
+        assert!(close(s.svi3["soc_current"], 11.7087, 1e-4));
+        assert!(close(s.svi3["misc_current"], 5.4628, 1e-4));
+        assert!(close(s.svi3["vdd_current"], 22.4457, 1e-4));
+        // The arithmetic that pinned them: each rail's power is its voltage times its current.
+        assert!(close(s.voltages["vddcr_soc"] * s.svi3["soc_current"], s.svi3["soc_power"], 1e-3));
+        assert!(close(s.voltages["cdd_misc"] * s.svi3["misc_current"], s.svi3["misc_power"], 1e-3));
+        let total = rows(Some(&s)).into_iter().find(|(i, _)| i.key == "cpu/power/svi3_total").unwrap().1.unwrap();
+        assert!(close(total, 30.773 + 14.9871 + 6.009, 1e-3));
+    }
+
+    #[test]
+    fn each_core_slot_is_one_core() {
+        let s = decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &x870_capture()).unwrap();
+        assert_eq!(s.core_count(), 8);
+        assert!(close(s.cores[0].temperature.unwrap(), 30.5326, 1e-4));
+        assert!(close(s.cores[1].temperature.unwrap(), 36.5891, 1e-4));
+        assert!(close(s.cores[7].voltage.unwrap(), 1.3498, 1e-4));
+        assert!(close(s.cores[3].clock_mhz.unwrap(), 5621.6, 0.01));
+        let rows = rows(Some(&s));
+        let row = |key: &str| rows.iter().find(|(i, _)| i.key == key).unwrap();
+        let (core1, temp) = row("cpu/temp/pm-core1");
+        assert_eq!((core1.label.as_str(), core1.parent.as_deref()), ("Core 1", Some("cpu/temp/pm-cores")));
+        assert!(close(temp.unwrap(), 36.5891, 1e-4));
+        assert!(close(row("cpu/volt/pm-cores").1.unwrap(), 1.3498, 1e-4), "the voltage heading is the highest");
+        assert_eq!(row("cpu/clk/pm-core7").0.label, "Core 7 Clock");
+    }
+
+    #[test]
+    fn a_six_core_part_s_empty_slots_are_no_cores() {
+        let mut qwords = x870_capture();
+        // Zero slots 6 and 7 of every block, as an unwritten slot reads.
+        for offset in [OFFSET_CORE_TEMPERATURE, OFFSET_CORE_VOLTAGE, OFFSET_CORE_CLOCK, OFFSET_CORE_C0, OFFSET_CORE_CC6]
+        {
+            for slot in 6..8u64 {
+                let dword = ((offset + 4 * slot) / 4) as usize;
+                let shift = if dword.is_multiple_of(2) { 0 } else { 32 };
+                qwords[dword / 2] &= !(0xFFFF_FFFFu64 << shift);
+            }
+        }
+        let s = decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &qwords).unwrap();
+        assert_eq!(s.core_count(), 6);
+        assert_eq!(s.cores[6], CoreSample::default(), "no residency either: 0 % would be believable");
+        assert!(rows(Some(&s)).iter().any(|(i, v)| i.key == "cpu/temp/pm-core6" && v.is_none()));
+    }
+
+    #[test]
+    fn residency_and_limit_use_read_as_hwinfo_shows_them() {
+        let s = decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &x870_capture()).unwrap();
+        assert!(close(s.cores[1].c0.unwrap(), 47.6546, 1e-4));
+        for core in &s.cores {
+            assert!(close(core.c0.unwrap() + core.cc6.unwrap(), 100.0, 1e-3));
+        }
+        // 57.9091 W of 810 W, 22.0701 A of 540 A, 37.25 A of 720 A, 42.078 C of 95 C.
+        assert!(close(limit_used(&s, "ppt").unwrap(), 7.149, 1e-3));
+        assert!(close(limit_used(&s, "tdc").unwrap(), 4.087, 1e-3));
+        assert!(close(limit_used(&s, "edc").unwrap(), 5.174, 1e-3));
+        assert!(close(limit_used(&s, "thermal").unwrap(), 44.293, 1e-3));
+        let rows = rows(Some(&s));
+        let row = |key: &str| rows.iter().find(|(i, _)| i.key == key).unwrap();
+        assert_eq!(row("cpu/load/pm-c0-core1").0.label, "Core 1 C0");
+        assert_eq!(row("cpu/load/pm-c0-core1").0.parent.as_deref(), Some("cpu/load/pm-c0-cores"));
+        assert_eq!((row("cpu/limit/ppt").0.unit.as_str(), row("cpu/limit/ppt").0.group), ("%", Group::Limiters));
+        // A zero limit is no percentage, and a slot with no core has no residency even though
+        // zero would be a believable one.
+        let mut zero = s.clone();
+        zero.limits.insert("ppt", 0.0);
+        assert_eq!(limit_used(&zero, "ppt"), None);
+    }
+
+    #[test]
+    fn a_copied_table_meets_the_same_gates_as_the_mailbox() {
+        let table = x870_capture();
+        assert_eq!(decode_copied_table(0x620205, X870_BASE, &table), Err(RsmuError::Version(0x620205)));
+        assert_eq!(decode_copied_table(EXPECTED_TABLE_VERSION, 0, &table), Err(RsmuError::Base(0)));
+        // A table that holds nothing believable is not shown as zeros.
+        let zeros = vec![0u64; table.len()];
+        assert_eq!(decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &zeros), Err(RsmuError::Nothing));
+        // Without a power figure the table is not trusted for temperatures, SVI3 or cores.
+        let mut untrusted = table.clone();
+        for offset in [0x008u64, 0x00C, 0x020, 0x024, 0x0FC, 0x100] {
+            let dword = (offset / 4) as usize;
+            let shift = if dword.is_multiple_of(2) { 0 } else { 32 };
+            untrusted[dword / 2] &= !(0xFFFF_FFFFu64 << shift);
+        }
+        let s = decode_copied_table(EXPECTED_TABLE_VERSION, X870_BASE, &untrusted).unwrap();
+        assert!(s.svi3.is_empty() && s.cores.is_empty() && s.temperatures.is_empty());
+        assert!(s.clocks.is_some(), "FCLK/UCLK carry their own cross-check");
     }
 }

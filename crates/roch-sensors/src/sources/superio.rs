@@ -177,9 +177,16 @@ enum Decode {
     VoltByte(f64),
     /// Word straight in RPM.
     RpmWord,
+    /// ITE tachometer: a 16-bit count whose low byte is at the address's low byte and whose high
+    /// byte is at its high byte (the two registers are not adjacent), as ITE's 1.35 MHz clock over
+    /// two pulses a revolution. A count of 0 or 0xFFFF is a header with nothing turning on it.
+    IteTach,
     /// Byte as a share of 255, in percent.
     DutyByte,
 }
+
+/// ITE's tachometer clock over two pulses a revolution.
+const ITE_TACH_CLOCK: f64 = 1_350_000.0;
 
 #[derive(Debug, Clone)]
 struct Channel {
@@ -222,6 +229,8 @@ static NCT679X_INTEL_BOARD: ConfirmedOn =
     ConfirmedOn { board: "ASUS ROG MAXIMUS Z790 APEX", products: &["ROG MAXIMUS Z790 APEX"] };
 static ITE_INTEL_BOARD: ConfirmedOn =
     ConfirmedOn { board: "Gigabyte Z890 AORUS TACHYON ICE", products: &["Z890 AORUS TACHYON ICE"] };
+static ITE_AMD_BOARD: ConfirmedOn =
+    ConfirmedOn { board: "Gigabyte X870 AORUS TACHYON ICE", products: &["X870 AORUS TACHYON ICE"] };
 
 /// The names this machine's SMBIOS gives its board: the board and system products, each whole and,
 /// for MSI's "Z790MPOWER (MS-7E01)", split into the name and the model code.
@@ -516,6 +525,27 @@ fn nct679x_intel() -> Vec<Channel> {
     ]
 }
 
+const fn ite_fan(key: &'static str, label: &'static str, low: u8, high: u8) -> Channel {
+    Channel {
+        key,
+        label,
+        group: Group::Fans,
+        unit: "RPM",
+        decimals: 0,
+        address: ((high as u16) << 8) | low as u16,
+        chip: None,
+        decode: Decode::IteTach,
+        band: (0.0, 20000.0),
+        hide_until_nonzero: true,
+        pairs_with: None,
+        note: "",
+    }
+}
+
+// In the ITE maps a voltage channel's `VoltByte` holds the input's divider, 1.0 for none: the two
+// parts do not share an LSB, so the chip's step is only known once the chip has identified, and
+// the probe multiplies it in then.
+
 /// Gigabyte Z890 AORUS TACHYON ICE: IT8696E at 0x2E (12 mV) and IT87952E at 0x4E (10.9 mV).
 fn ite_intel() -> Vec<Channel> {
     vec![
@@ -525,22 +555,92 @@ fn ite_intel() -> Vec<Channel> {
         on(temp("temp/vrm", "VRM MOS", 0x2D, Decode::TempByteIte, (1.0, 125.0)), "IT8696E"),
         on(
             noted(
-                volt("volt/vcore", "Vcore", 0x20, Decode::VoltByte(0.0), (0.40, 1.80)),
+                volt("volt/vcore", "Vcore", 0x20, Decode::VoltByte(1.0), (0.40, 1.80)),
                 "inside HWiNFO's DLVRin range",
             ),
             "IT8696E",
         ),
         on(
-            noted(volt("volt/sa", "VCCSA", 0x26, Decode::VoltByte(0.0), (0.60, 1.70)), "HWiNFO VCCSA 1.308, exact"),
+            noted(volt("volt/sa", "VCCSA", 0x26, Decode::VoltByte(1.0), (0.60, 1.70)), "HWiNFO VCCSA 1.308, exact"),
             "IT8696E",
         ),
-        on(volt("volt/vnnaon", "CPU VNNAON", 0x25, Decode::VoltByte(0.0), (0.40, 1.40)), "IT8696E"),
+        on(volt("volt/vnnaon", "CPU VNNAON", 0x25, Decode::VoltByte(1.0), (0.40, 1.40)), "IT8696E"),
         on(
-            noted(volt("volt/vdd2", "VDD2", 0x21, Decode::VoltByte(0.0), (0.90, 1.60)), "HWiNFO CPU VDD2 1.111"),
+            noted(volt("volt/vdd2", "VDD2", 0x21, Decode::VoltByte(1.0), (0.90, 1.60)), "HWiNFO CPU VDD2 1.111"),
             "IT87952E",
         ),
-        on(volt("volt/vccio", "VCCIO", 0x24, Decode::VoltByte(0.0), (0.80, 1.80)), "IT87952E"),
+        on(volt("volt/vccio", "VCCIO", 0x24, Decode::VoltByte(1.0), (0.80, 1.80)), "IT87952E"),
     ]
+}
+
+/// Gigabyte X870 AORUS TACHYON ICE (AM5): IT8696E alone, at 0x2E, window 0x0A40, 12 mV a count.
+///
+/// The same chip as the Z890 board's first one and the same five thermistors, but the voltage
+/// inputs carry AMD's rails: what the Z890 map calls VCCSA (0x26) and CPU VNNAON (0x25) read
+/// 1.428 and 1.116 V here, which HWiNFO 8.52 names CPU VDDIO_MEM and CPU VCORE MISC on the same
+/// boot, and 0x24 reads its CPU VCORE SoC (1.272 V). Those two CPU rails sit 8 and 16 mV off the
+/// SVI3 telemetry the SMU reports for VDDCR_SOC (1.280) and VDD_MISC (1.100), the board measuring
+/// after its own drop. The supplies and the two fitted fans were matched by Roch Viewer on this
+/// board (`am5_board_rails`): +12V 168 counts x 6 = 12.096 V, +3.3V x 1.65, +5V x 2.5, 3VSB, VBAT
+/// and AVCC3 x 2, each within a count of the reference; the CPU and CPU_OPT headers at 1558 and
+/// 3609 RPM in HWiNFO. The other four fan headers read 0xFFFF with nothing fitted, so which System
+/// Fan is which has not been seen, and they stay hidden until one turns.
+fn ite_x870_tachyon() -> Vec<Channel> {
+    const IT: &str = "IT8696E";
+    vec![
+        on(temp("temp/system", "System 1", 0x29, Decode::TempByteIte, (1.0, 125.0)), IT),
+        on(temp("temp/pch", "PCH", 0x2A, Decode::TempByteIte, (1.0, 125.0)), IT),
+        on(temp("temp/cpu", "CPU", 0x2B, Decode::TempByteIte, (1.0, 125.0)), IT),
+        on(
+            noted(temp("temp/pciex16", "PCIEX16", 0x2C, Decode::TempByteIte, (1.0, 125.0)), "HWiNFO PCIEX16 34, exact"),
+            IT,
+        ),
+        on(temp("temp/vrm", "VRM MOS", 0x2D, Decode::TempByteIte, (1.0, 125.0)), IT),
+        on(noted(volt("volt/vcore", "Vcore", 0x20, Decode::VoltByte(1.0), (0.30, 1.80)), "HWiNFO Vcore"), IT),
+        on(
+            noted(
+                volt("volt/vcore_soc", "CPU VCORE SoC", 0x24, Decode::VoltByte(1.0), (0.60, 1.50)),
+                "HWiNFO 1.272, exact",
+            ),
+            IT,
+        ),
+        on(
+            noted(
+                volt("volt/vcore_misc", "CPU VCORE MISC", 0x25, Decode::VoltByte(1.0), (0.60, 1.50)),
+                "HWiNFO 1.116, exact",
+            ),
+            IT,
+        ),
+        on(
+            noted(
+                volt("volt/vddio", "CPU VDDIO_MEM", 0x26, Decode::VoltByte(1.0), (0.90, 1.80)),
+                "HWiNFO 1.428, exact; the memory controller's I/O rail, not the DIMMs' own",
+            ),
+            IT,
+        ),
+        on(noted(volt("volt/12v", "+12V", 0x22, Decode::VoltByte(6.0), (10.8, 13.2)), "divider 6:1"), IT),
+        on(noted(volt("volt/5v", "+5V", 0x23, Decode::VoltByte(2.5), (4.5, 5.5)), "divider 2.5:1"), IT),
+        on(noted(volt("volt/3v3", "+3.3V", 0x21, Decode::VoltByte(1.65), (3.0, 3.6)), "divider 1.65:1"), IT),
+        on(noted(volt("volt/3vsb", "3VSB", 0x27, Decode::VoltByte(2.0), (3.0, 3.6)), "divider 2:1"), IT),
+        on(noted(volt("volt/vbat", "VBAT", 0x28, Decode::VoltByte(2.0), (2.0, 3.6)), "divider 2:1"), IT),
+        on(noted(volt("volt/avcc3", "AVCC3", 0x2F, Decode::VoltByte(2.0), (3.0, 3.6)), "divider 2:1"), IT),
+        on(ite_fan("fan/cpu", "CPU Fan", 0x0D, 0x18), IT),
+        on(ite_fan("fan/sys1", "System Fan 1", 0x0E, 0x19), IT),
+        on(ite_fan("fan/sys2", "System Fan 2", 0x0F, 0x1A), IT),
+        on(ite_fan("fan/sys3", "System Fan 3", 0x80, 0x81), IT),
+        on(ite_fan("fan/cpu_opt", "CPU_OPT", 0x82, 0x83), IT),
+        on(ite_fan("fan/fan6", "Fan 6", 0x84, 0x85), IT),
+    ]
+}
+
+/// The ITE map for this machine, and where it was confirmed. As with the Nuvoton maps the CPU's
+/// vendor decides the rails: an AM5 board's inputs carry AMD's, so an AMD machine never gets the
+/// Z890 board's Intel names, and each map's caveat flags any board it was not confirmed on.
+fn ite_map(vendor: Vendor) -> (Vec<Channel>, &'static ConfirmedOn) {
+    match vendor {
+        Vendor::Amd => (ite_x870_tachyon(), &ITE_AMD_BOARD),
+        _ => (ite_intel(), &ITE_INTEL_BOARD),
+    }
 }
 
 /// Each chip with the ports that reach it: one PawnIO handle per config slot, or inpoutx64.
@@ -664,13 +764,14 @@ impl SuperIo {
             let name = format!("ITE {}", names.join(" + "));
             let where_: Vec<String> =
                 ite.iter().map(|(_, c)| format!("{} at 0x{:02X} window 0x{:04X}", c.name, c.port, c.base)).collect();
-            let channels = ite_intel()
+            let (map, confirmed) = ite_map(vendor);
+            let channels = map
                 .into_iter()
                 .filter(|c| c.chip.is_some_and(|n| names.contains(&n)))
                 .map(|mut c| {
                     let step = ite.iter().find(|(_, i)| Some(i.name) == c.chip).map_or(0.0, |(_, i)| i.step);
-                    if let Decode::VoltByte(_) = c.decode {
-                        c.decode = Decode::VoltByte(step);
+                    if let Decode::VoltByte(divider) = c.decode {
+                        c.decode = Decode::VoltByte(step * divider);
                     }
                     c
                 })
@@ -682,7 +783,7 @@ impl SuperIo {
             }
             chips.reverse();
             let status = format!("Super I/O: {}, through {driver}.", where_.join(", "));
-            let (detail, status) = describe(&name, status, &ITE_INTEL_BOARD, &sys.smbios);
+            let (detail, status) = describe(&name, status, confirmed, &sys.smbios);
             return Probe::Found(Box::new(SuperIo {
                 device: board_device(sys, &detail),
                 chip: name,
@@ -741,8 +842,17 @@ impl SuperIo {
                 .iter()
                 .map(|c| {
                     let (chip, io) = chips.iter().find(|(i, _)| Some(i.name) == c.chip)?;
-                    io.outb(chip.base + 5, c.address as u8)?;
-                    io.inb(chip.base + 6).map(u32::from)
+                    let read = |register: u8| -> Option<u32> {
+                        io.outb(chip.base + 5, register)?;
+                        io.inb(chip.base + 6).map(u32::from)
+                    };
+                    match c.decode {
+                        Decode::IteTach => {
+                            let low = read(c.address as u8)?;
+                            Some((read((c.address >> 8) as u8)? << 8) | low)
+                        }
+                        _ => read(c.address as u8),
+                    }
                 })
                 .collect(),
         };
@@ -763,6 +873,10 @@ fn decode(raw: u32, d: Decode) -> f64 {
         Decode::RpmWord => {
             let v = raw & 0xFFFF;
             if v == 0xFFFF { f64::NAN } else { v as f64 }
+        }
+        Decode::IteTach => {
+            let count = raw & 0xFFFF;
+            if count == 0 || count == 0xFFFF { f64::NAN } else { (ITE_TACH_CLOCK / (2.0 * count as f64)).round() }
         }
         Decode::DutyByte => (raw & 0xFF) as f64 / 255.0 * 100.0,
     }
@@ -901,6 +1015,68 @@ mod tests {
         assert_eq!(pro, mine);
         // An AMD machine with the same board code still gets the AMD map.
         assert!(std::ptr::eq(nuvoton_map(Family::Nct668x, Vendor::Amd, &z790m).1, &NCT668X_AMD_BOARD));
+    }
+
+    /// An ITE map with the IT8696E's 12 mV step multiplied in, as the probe does.
+    fn resolved(map: Vec<Channel>) -> Vec<Channel> {
+        map.into_iter()
+            .map(|mut c| {
+                if let Decode::VoltByte(divider) = c.decode {
+                    c.decode = Decode::VoltByte(0.012 * divider);
+                }
+                c
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_x870_tachyon_decodes_to_hwinfos_numbers() {
+        let tachyon = board("X870 AORUS TACHYON ICE", "X870 AORUS TACHYON ICE");
+        let (map, confirmed) = ite_map(Vendor::Amd);
+        assert!(std::ptr::eq(confirmed, &ITE_AMD_BOARD));
+        assert!(confirmed.caveat(&tachyon).is_none(), "its own board: no caveat");
+        let channels = resolved(map);
+        let at = |key: &str, raw: u32| {
+            let c = channels.iter().find(|c| c.key == key).unwrap();
+            decode(raw, c.decode)
+        };
+        // Raw counts off the bench beside HWiNFO 8.52's IT8696E block.
+        assert!((at("volt/vcore_soc", 106) - 1.272).abs() < 1e-9);
+        assert!((at("volt/vcore_misc", 93) - 1.116).abs() < 1e-9);
+        assert!((at("volt/vddio", 119) - 1.428).abs() < 1e-9);
+        assert!((at("volt/12v", 168) - 12.096).abs() < 1e-9);
+        assert!((at("volt/3v3", 167) - 3.3066).abs() < 1e-9);
+        assert!((at("volt/5v", 161) - 4.830).abs() < 1e-9);
+        assert!((at("volt/3vsb", 139) - 3.336).abs() < 1e-9);
+        assert!((at("volt/vbat", 126) - 3.024).abs() < 1e-9);
+        assert!((at("volt/avcc3", 128) - 3.072).abs() < 1e-9);
+        assert_eq!(at("temp/pciex16", 34), 34.0);
+        // CPU_OPT: 187 counts is HWiNFO's 3609 RPM; the CPU header's 433 counts its 1558.
+        assert_eq!(at("fan/cpu_opt", 187), 3610.0);
+        assert_eq!(at("fan/cpu", (1 << 8) | 177), 1559.0);
+        assert!(at("fan/sys1", 0xFFFF).is_nan(), "a header with nothing fitted");
+        assert!(at("fan/sys1", 0).is_nan());
+        // No Intel rail name survives on an AMD board.
+        for intel in ["VCCSA", "CPU VNNAON", "VDD2", "VCCIO"] {
+            assert!(!channels.iter().any(|c| c.label == intel), "{intel}");
+        }
+    }
+
+    #[test]
+    fn each_vendor_gets_its_own_ite_map_and_keeps_the_caveat_elsewhere() {
+        let (intel, confirmed) = ite_map(Vendor::Intel);
+        assert!(std::ptr::eq(confirmed, &ITE_INTEL_BOARD));
+        assert!(intel.iter().any(|c| c.label == "VCCSA"));
+        // The Intel map's voltages still resolve to the chip's own step.
+        let sa = resolved(intel).into_iter().find(|c| c.key == "volt/sa").unwrap();
+        assert!((decode(109, sa.decode) - 1.308).abs() < 1e-9);
+        let other_am5 = board("X870E AORUS MASTER", "X870E AORUS MASTER");
+        let (detail, _) = describe("ITE IT8696E", "Super I/O: found.".into(), &ITE_AMD_BOARD, &other_am5);
+        assert_eq!(detail, "ITE IT8696E · map from Gigabyte X870 AORUS TACHYON ICE, unconfirmed here");
+        // Every ITE fan's two registers are distinct and both inside the chip's file.
+        for c in ite_x870_tachyon().iter().filter(|c| matches!(c.decode, Decode::IteTach)) {
+            assert_ne!(c.address & 0xFF, c.address >> 8, "{}", c.key);
+        }
     }
 
     #[test]

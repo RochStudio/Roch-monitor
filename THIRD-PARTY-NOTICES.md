@@ -47,6 +47,10 @@ and each module's source is the `.p` file of the same name in that repository at
 Monitor calls. They cannot be modified and still load: the driver accepts only modules signed by
 their author.
 
+An eighth module, RyzenSMU (Copyright (C) namazso, LGPL-2.1-or-later), is not distributed here:
+where the user's PawnIO installation carries it, Roch Monitor loads that copy from the installation's
+`modules` folder to read the AMD SMU's PM table.
+
 The modules run inside the PawnIO driver (https://pawnio.eu), which the user installs from its
 author's own signed installer. The driver is not included in this repository or in any build produced
 from it. The calling convention in `crates/roch-sensors/src/hw/pawnio.rs` (the two IOCTLs and the

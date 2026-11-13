@@ -75,6 +75,24 @@ pub fn load_error(module: &str, err: u32) -> String {
     }
 }
 
+/// Where the PawnIO installer puts its own copies of the signed modules: `modules` under the
+/// install folder in Program Files. Only that folder is searched, never one a user can write to;
+/// the driver checks each module's signature as it loads it either way.
+pub fn installed_module_path(name: &str, program_files: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(program_files?);
+    root.is_absolute().then(|| root.join("PawnIO").join("modules").join(format!("{name}.bin")))
+}
+
+/// A module the PawnIO installation carries, for one this crate does not bundle (RyzenSMU).
+pub fn installed_module(name: &str) -> Result<Vec<u8>, String> {
+    let program_files = std::env::var_os("ProgramW6432").or_else(|| std::env::var_os("ProgramFiles"));
+    let path = installed_module_path(name, program_files.as_deref())
+        .ok_or_else(|| "the Program Files folder could not be found".to_owned())?;
+    std::fs::read(&path).map_err(|_| {
+        format!("PawnIO's {name} module is not in {}; this PawnIO installation does not carry it", path.display())
+    })
+}
+
 #[cfg(windows)]
 mod imp {
     use super::*;
@@ -282,7 +300,48 @@ mod imp {
                 port: None.into(),
             })
         }
+    }
 
+    /// PawnIO's RyzenSMU module: the SMU's PM table on Ryzen. The module runs the RSMU mailbox
+    /// itself (version, table address, transfer) and copies the table out of DRAM, so no physical
+    /// address ever passes through this process. Only its four read functions are named here; it
+    /// also exports a raw SMU command and register writes, which nothing in Roch Monitor calls.
+    pub struct RyzenSmu {
+        io: PawnIo,
+    }
+
+    impl RyzenSmu {
+        pub fn open() -> Result<RyzenSmu, String> {
+            let blob = super::installed_module("RyzenSMU")?;
+            Ok(RyzenSmu { io: PawnIo::open("RyzenSMU", &blob)? })
+        }
+
+        /// The module's name for this processor's code name (17 on a Granite Ridge).
+        pub fn code_name(&self) -> Option<u64> {
+            self.io.value("ioctl_get_code_name", &[]).ok()
+        }
+
+        /// (table version, table base), from the SMU's own answers.
+        pub fn resolve_pm_table(&self) -> Result<(u32, u64), u32> {
+            let v = self.io.execute("ioctl_resolve_pm_table", &[], 2)?;
+            match v.as_slice() {
+                [version, base, ..] => Ok((*version as u32, *base)),
+                _ => Err(0),
+            }
+        }
+
+        /// Ask the SMU to refresh the table in DRAM.
+        pub fn update_pm_table(&self) -> Result<(), u32> {
+            self.io.execute("ioctl_update_pm_table", &[], 0).map(|_| ())
+        }
+
+        /// The table's first `bytes` bytes, as little-endian qwords.
+        pub fn read_pm_table(&self, bytes: usize) -> Result<Vec<u64>, u32> {
+            self.io.execute("ioctl_read_pm_table", &[], bytes.div_ceil(8))
+        }
+    }
+
+    impl SmbusModule {
         pub fn piix4() -> Result<SmbusModule, String> {
             let io = PawnIo::open("SmbusPIIX4", SMBUS_PIIX4_MODULE)?;
             // -1 asks which port is selected without changing it.
@@ -396,7 +455,7 @@ mod imp {
 }
 
 #[cfg(windows)]
-pub use imp::{Mchbar, PawnIo, Pinned, PortModule, Raised, SmbusModule, available, pin_to, raise_priority};
+pub use imp::{Mchbar, PawnIo, Pinned, PortModule, Raised, RyzenSmu, SmbusModule, available, pin_to, raise_priority};
 
 #[cfg(not(windows))]
 pub fn available() -> Result<(), String> {
@@ -406,6 +465,17 @@ pub fn available() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn an_installed_module_is_looked_for_in_program_files_only() {
+        use std::ffi::OsStr;
+        let path = installed_module_path("RyzenSMU", Some(OsStr::new(r"C:\Program Files"))).unwrap();
+        assert_eq!(path, std::path::Path::new(r"C:\Program Files\PawnIO\modules\RyzenSMU.bin"));
+        assert!(installed_module_path("RyzenSMU", None).is_none());
+        // A relative "Program Files" would resolve against the working directory.
+        assert!(installed_module_path("RyzenSMU", Some(OsStr::new("Program Files"))).is_none());
+    }
 
     #[test]
     fn the_ioctls_are_pawnios_own() {

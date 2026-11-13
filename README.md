@@ -26,10 +26,11 @@ read.
 | --- | --- | --- |
 | System | physical and virtual memory used, available, load | `GlobalMemoryStatusEx` |
 | CPU | per-core temperatures, clocks (ratio × bus clock) and VIDs; per-thread effective clocks; CPU Package; the DTS throttling, critical-temperature and power-limit flags | MSRs through PawnIO (Intel) |
-| CPU | per-thread effective clocks and per-core power (AMD Zen; not yet checked on AMD hardware) | MSRs through PawnIO |
+| CPU | per-thread effective clocks and per-core power (AMD Zen) | MSRs through PawnIO |
+| CPU | Tctl and its limit, per-core temperatures, clocks and voltages, the I/O die, L3 and SVI3 VRM temperatures, VDDCR_VDD/SOC, VDD_MISC, VDDG and VDDP, the SVI3 rails' currents and power, per-core C0 and CC6 residency, PPT/TDC/EDC against their limits and how much of each (and of the thermal limit) is in use, FCLK and UCLK (desktop Ryzen 9000) | SMU PM table through PawnIO's RyzenSMU, else inpoutx64 |
 | CPU | Core Max (sampled every 200 ms for its peaks), package and IA-core power, VCCSA, VDDQ TX, bus and ring clock | MCHBAR |
 | CPU | total and per-thread usage, labelled P-core/E-core; average, per-thread and effective clocks when PawnIO is not installed | performance counters, `GetLogicalProcessorInformationEx` |
-| Motherboard | temperatures, Vcore, SA, DRAM, CPU AUX, +12V/+5V/+3.3V, fan speeds and duty | Super I/O (Nuvoton NCT668x/NCT679x, ITE) |
+| Motherboard | temperatures, Vcore, SA, DRAM, CPU AUX (AM5: CPU VCORE SoC/MISC, VDDIO_MEM), +12V/+5V/+3.3V, fan speeds and duty | Super I/O (Nuvoton NCT668x/NCT679x, ITE) |
 | Motherboard | VRM temperature (ASUS boards) | ACPI embedded controller |
 | Memory | data rate, MCLK, UCLK | MCHBAR |
 | Each DIMM | DDR4: on-module thermal sensor. DDR5: SPD hub temperature, PMIC-measured VDD/VDDQ/VPP/VIN/1.8 V/1.0 V and module power | SMBus |
@@ -44,8 +45,10 @@ number.
 
 Every row that needs a kernel driver (the MSRs, MCHBAR, the Super I/O, the SMBus, the EC) reads
 through **PawnIO** where it is installed, and through **inpoutx64** for anything PawnIO cannot serve.
-With PawnIO installed, an Intel machine never loads inpoutx64; an AMD one still does for the SMU's
-PM table, if inpoutx64 is there. **Sources** names the driver each source used.
+With PawnIO installed, neither an Intel nor an AMD machine loads inpoutx64: the SMU's PM table is
+read through the RyzenSMU module the PawnIO installation carries. The PBO scalar, which has a mailbox
+message of its own, is left out on that path; `--driver inpoutx64` still reads it. **Sources** names
+the driver each source used.
 
 ### Validated on
 
@@ -66,6 +69,15 @@ Monitor shows reads the same there, the DIMMs' SPD hubs and PMICs agree, and HWi
 "Unknown Rail (D4)" and "(D6)" powers are the "Rail 212" and "Rail 214" currents times the 12 V
 input. It is the PRO Z790-P's layout except for one input, which carries CPU VDD2 on this DDR5
 board where the DDR4 one has DRAM.
+
+The Gigabyte X870 AORUS TACHYON ICE (ITE IT8696E, Ryzen 7 9850X3D, 2 × 16 GB DDR5-6400,
+Radeon RX 9070 XT) has an AM5 map of its own, checked against HWiNFO 8.52 on the same boot: its
+IT8696E reads CPU VCORE SoC, CPU VCORE MISC and CPU VDDIO_MEM where the Z890 board's reads VCCSA and
+VNNAON, and every supply, thermistor and fitted fan matches. On that machine every CPU row comes
+through PawnIO alone: the SMU PM table through RyzenSMU (the same table at the same address the
+inpoutx64 path reads, with the same values) and the SVI3 currents and powers within a few tenths of
+HWiNFO's own "(SVI3 TFN)" rows; each per-core block was tied to its core by loading one thread at a
+time.
 
 A board with a supported chip but no map of its own gets the nearest one, and its heading and
 **Sources** say which board that map was confirmed on.
@@ -141,8 +153,8 @@ RochMonitor.exe --help
   modules it loads into it (`crates/roch-sensors/res/pawnio`), each of which admits only its own
   hardware: the MSRs on an allow-list, the memory controller's window, the Super I/O's ports, the
   SMBus controller.
-- **inpoutx64** (optional fallback): for a machine without PawnIO, and for the AMD SMU's PM table,
-  which is still read through it. It is not distributed here, for the reasons Roch Viewer gives:
+- **inpoutx64** (optional fallback): for a machine without PawnIO, and for the AMD SMU's PM table
+  where the PawnIO installation does not carry its RyzenSMU module. It is not distributed here, for the reasons Roch Viewer gives:
   download `inpoutx64.dll` and `inpoutx64.sys` from Highresolution Enterprises (www.highrez.co.uk)
   and put both beside `RochMonitor.exe`. It hands any administrator process every I/O port and all
   of physical memory, which is why security software warns about it and why PawnIO is preferred.

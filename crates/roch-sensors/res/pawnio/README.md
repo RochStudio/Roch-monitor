@@ -17,6 +17,13 @@ at tag `0.2.11`.
 | `SmbusI801.bin` | Steve-Tech | `a0f7d066e7efda28c0e754c1f52dbd8dc280d388ba8575b514a80cb67490530c` | `ioctl_identity`, `ioctl_smbus_xfer`: Intel PCH SMBus (DIMM sensors) |
 | `SmbusPIIX4.bin` | Steve-Tech | `91f9b4b1c39e3d399ce48477a89d8f6bd3e58a2241064a4daec3a1513dff56e5` | `ioctl_identity`, `ioctl_piix4_port_sel` (ports 0 and 1), `ioctl_smbus_xfer`: AMD FCH SMBus |
 
+One more module is used but not bundled: `RyzenSMU.bin` (namazso), the SMU's PM table on Ryzen. It is
+loaded from the PawnIO installation's own `modules` folder in Program Files, where the installer puts
+it, and only its `ioctl_resolve_pm_table`, `ioctl_update_pm_table` and `ioctl_read_pm_table` (and
+`ioctl_get_code_name`) are called; its raw SMU command and register writes are not. Where the
+installation does not carry it, the table falls back to inpoutx64. Bundling it here, from the same
+0.2.11 release as the others, would make that fallback unnecessary.
+
 They run inside the PawnIO driver, which the user installs (https://pawnio.eu); Roch Monitor only
 loads them into its own handles. The driver accepts only modules signed by their author, so these are
 the release files byte for byte and must not be rebuilt or edited (`.gitattributes` marks them

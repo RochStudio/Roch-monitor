@@ -65,6 +65,31 @@ impl AmdTelemetryMapper {
         p(58, "PCIe maximum generation", "gen"),
     ];
 
+    /// Whether a card reports ADL_PMLOG_BUS_SPEED (sensor 40) as a zero-based speed index rather
+    /// than the PCIe generation: true for RDNA 4 (Navi 4x, PCI device 0x75xx).
+    ///
+    /// Measured on an RX 9070 XT (Navi 48, driver 26.10.2, X870 board): sensor 40 read 4 while the
+    /// Link Status register of both the CPU's root port and the card's own upstream switch port
+    /// read 32 GT/s, PCIe 5.0, at idle and again a minute later. Sensor 41 read 2 against a
+    /// negotiated width of x2 on both (the card narrows its link at idle), and sensor 58 read 5
+    /// against a Link Capabilities of 5.0, so only sensor 40 is offset. Other generations are left
+    /// as they were: nothing here was measured on them.
+    pub fn bus_speed_is_zero_based(device_id: i32) -> bool {
+        device_id & 0xFF00 == 0x7500
+    }
+
+    /// Turn sensor 40 into the PCIe generation where the card reports it zero-based. Called on the
+    /// raw sample, before [`Self::map`], so every reader of `adl:40` sees a generation.
+    pub fn normalize_bus_speed(pm: &mut HashMap<i32, f64>, device_id: i32) {
+        if Self::bus_speed_is_zero_based(device_id)
+            && let Some(speed) = pm.get_mut(&40)
+            && speed.is_finite()
+            && *speed >= 0.0
+        {
+            *speed += 1.0;
+        }
+    }
+
     /// The value, or NaN when it is not a believable reading for `unit`: non-finite, negative,
     /// zero where zero means "not reported", above 256 °C or above 100 %.
     pub fn valid(value: f64, unit: &str, positive_only: bool) -> f64 {
@@ -223,6 +248,31 @@ mod tests {
         let t = AmdTelemetryMapper::map(&HashMap::new(), &adlx_sample());
         assert_eq!(t.core_clock_mhz, 2400.0, "ADLX works when PMLog fails");
         assert!(t.fabric_clock_mhz.is_nan(), "fallback does not fabricate FCLK");
+    }
+
+    #[test]
+    fn rdna4_bus_speed_index_becomes_the_generation() {
+        // The RX 9070 XT's idle sample against its root port's Link Status: 32 GT/s at x2.
+        let mut pm: HashMap<i32, f64> = [(40, 4.0), (41, 2.0), (58, 5.0)].into_iter().collect();
+        AmdTelemetryMapper::normalize_bus_speed(&mut pm, 0x7550);
+        let t = AmdTelemetryMapper::map(&pm, &HashMap::new());
+        assert_eq!(single(&t, "adl:40").value, 5.0, "PCIe 5.0, not 4.0");
+        assert_eq!(single(&t, "adl:41").value, 2.0, "width untouched");
+        assert_eq!(single(&t, "adl:58").value, 5.0, "maximum untouched");
+        // Navi 44 shares the interface; RDNA 3 (Navi 31, 0x744C) and anything unknown keep theirs.
+        assert!(AmdTelemetryMapper::bus_speed_is_zero_based(0x7590));
+        for device in [0x744C, 0x73BF, 0] {
+            let mut pm: HashMap<i32, f64> = [(40, 4.0)].into_iter().collect();
+            AmdTelemetryMapper::normalize_bus_speed(&mut pm, device);
+            assert_eq!(pm[&40], 4.0, "{device:#x}");
+        }
+        // A missing or unbelievable reading is not invented or nudged into range.
+        let mut pm: HashMap<i32, f64> = [(40, f64::NAN)].into_iter().collect();
+        AmdTelemetryMapper::normalize_bus_speed(&mut pm, 0x7550);
+        assert!(pm[&40].is_nan());
+        let mut pm = HashMap::new();
+        AmdTelemetryMapper::normalize_bus_speed(&mut pm, 0x7550);
+        assert!(pm.is_empty());
     }
 
     #[test]
